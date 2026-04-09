@@ -442,43 +442,107 @@ def main() -> None:
         args.max_frames if args.max_frames is not None else num_frames
     )
 
-    per_frame: dict = {}
+    # Prepare output writers so we can stream results instead of accumulating
+    # all masks in memory (which OOMs on long videos).
+    json_results: dict = {}  # frame_idx -> list of object dicts (no masks)
+    mask_dir = args.output_masks
+    if mask_dir is not None:
+        os.makedirs(mask_dir, exist_ok=True)
+
+    overlay_writer = None
+    overlay_frames_source = None
+    cv2_mod = None
+    if args.overlay_video is not None:
+        cv2_mod = _import_cv2()
+        print("Loading original frames for overlay rendering...")
+        orig_w, orig_h, fps, overlay_frames_source = load_original_frames(args.video)
+        if (orig_w, orig_h) != (video_w, video_h):
+            print(
+                f"  note: overlay frame size {orig_w}x{orig_h} differs from "
+                f"tracker-reported {video_w}x{video_h}; using overlay size."
+            )
+        os.makedirs(
+            os.path.dirname(os.path.abspath(args.overlay_video)), exist_ok=True
+        )
+        fourcc = cv2_mod.VideoWriter_fourcc(*"mp4v")
+        overlay_writer = cv2_mod.VideoWriter(
+            args.overlay_video, fourcc, fps, (orig_w, orig_h)
+        )
+
     print("Propagating mask through the video...")
-    for (
-        frame_idx,
-        obj_ids,
-        _low_res_masks,
-        video_res_masks,
-        obj_scores,
-    ) in predictor.propagate_in_video(
-        inference_state=inference_state,
-        start_frame_idx=args.start_frame,
-        max_frame_num_to_track=max_frame_num_to_track,
-        reverse=False,
-        propagate_preflight=True,
-    ):
-        frame_entries = []
-        # video_res_masks: [num_objects, 1, H, W] mask logits
-        # obj_scores:      [num_objects, 1]       objectness logits
-        masks_np = (video_res_masks > 0.0).squeeze(1).cpu().numpy()
-        scores_np = obj_scores.sigmoid().squeeze(-1).float().cpu().numpy()
-        for i, obj_id in enumerate(obj_ids):
-            mask_bool = masks_np[i].astype(bool)
-            bbox_xyxy_px = mask_to_bbox_xyxy(mask_bool)
-            frame_entries.append(
-                {
+    try:
+        for (
+            frame_idx,
+            obj_ids,
+            _low_res_masks,
+            video_res_masks,
+            obj_scores,
+        ) in predictor.propagate_in_video(
+            inference_state=inference_state,
+            start_frame_idx=args.start_frame,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=False,
+            propagate_preflight=True,
+        ):
+            # video_res_masks: [num_objects, 1, H, W] mask logits
+            # obj_scores:      [num_objects, 1]       objectness logits
+            masks_np = (video_res_masks > 0.0).squeeze(1).cpu().numpy()
+            scores_np = obj_scores.sigmoid().squeeze(-1).float().cpu().numpy()
+
+            frame_entries = []
+            for i, obj_id in enumerate(obj_ids):
+                mask_bool = masks_np[i].astype(bool)
+                bbox_xyxy_px = mask_to_bbox_xyxy(mask_bool)
+                entry = {
                     "obj_id": int(obj_id),
                     "score": float(scores_np[i]),
                     "bbox_xyxy_pixels": bbox_xyxy_px,
                     "present": bbox_xyxy_px is not None,
                 }
-            )
-        per_frame[int(frame_idx)] = {
-            "objects": frame_entries,
-            "masks": masks_np,  # kept in-memory only; stripped before JSON dump
-        }
+                frame_entries.append(entry)
 
-    print(f"Tracked {len(per_frame)} frames.")
+                # Stream mask PNGs to disk immediately
+                if mask_dir is not None:
+                    png_path = os.path.join(
+                        mask_dir,
+                        f"frame{frame_idx:06d}_obj{int(obj_id)}.png",
+                    )
+                    Image.fromarray(
+                        mask_bool.astype(np.uint8) * 255, mode="L"
+                    ).save(png_path)
+
+            # Stream overlay frames to video writer immediately
+            if overlay_writer is not None and overlay_frames_source is not None:
+                frame_rgb = overlay_frames_source[frame_idx]
+                obj = frame_entries[0] if frame_entries else None
+                if obj is not None and obj["present"]:
+                    mask_bool = masks_np[0].astype(bool)
+                    if mask_bool.shape != frame_rgb.shape[:2]:
+                        mask_bool = cv2_mod.resize(
+                            mask_bool.astype(np.uint8),
+                            (frame_rgb.shape[1], frame_rgb.shape[0]),
+                            interpolation=cv2_mod.INTER_NEAREST,
+                        ).astype(bool)
+                    overlay = draw_overlay(
+                        frame_rgb, mask_bool, obj["bbox_xyxy_pixels"],
+                        obj["obj_id"], frame_idx,
+                    )
+                else:
+                    overlay = draw_overlay(
+                        frame_rgb, None, None, args.obj_id, frame_idx,
+                    )
+                overlay_writer.write(
+                    cv2_mod.cvtColor(overlay, cv2_mod.COLOR_RGB2BGR)
+                )
+
+            # Only keep lightweight metadata — no masks in memory
+            json_results[int(frame_idx)] = frame_entries
+
+    finally:
+        if overlay_writer is not None:
+            overlay_writer.release()
+
+    print(f"Tracked {len(json_results)} frames.")
 
     if args.output_json is not None:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
@@ -490,73 +554,17 @@ def main() -> None:
             "seed_frame": args.start_frame,
             "seed_bbox_xyxy_normalized": box_norm.tolist()[0],
             "frames": {
-                str(idx): [
-                    {k: v for k, v in obj.items()}
-                    for obj in data["objects"]
-                ]
-                for idx, data in sorted(per_frame.items())
+                str(idx): entries
+                for idx, entries in sorted(json_results.items())
             },
         }
         with open(args.output_json, "w") as f:
             json.dump(serializable, f, indent=2)
         print(f"Saved tracking results to {args.output_json}")
 
-    if args.output_masks is not None:
-        os.makedirs(args.output_masks, exist_ok=True)
-        for idx, data in sorted(per_frame.items()):
-            for i, obj in enumerate(data["objects"]):
-                mask_bool = data["masks"][i]
-                png_path = os.path.join(
-                    args.output_masks,
-                    f"frame{idx:06d}_obj{obj['obj_id']}.png",
-                )
-                Image.fromarray(mask_bool.astype(np.uint8) * 255, mode="L").save(
-                    png_path
-                )
-        print(f"Saved per-frame masks to {args.output_masks}")
-
+    if mask_dir is not None:
+        print(f"Saved per-frame masks to {mask_dir}")
     if args.overlay_video is not None:
-        cv2 = _import_cv2()
-        print("Loading original frames for overlay rendering...")
-        orig_w, orig_h, fps, orig_frames = load_original_frames(args.video)
-        if (orig_w, orig_h) != (video_w, video_h):
-            print(
-                f"  note: overlay frame size {orig_w}x{orig_h} differs from "
-                f"tracker-reported {video_w}x{video_h}; using overlay size."
-            )
-        os.makedirs(
-            os.path.dirname(os.path.abspath(args.overlay_video)), exist_ok=True
-        )
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            args.overlay_video, fourcc, fps, (orig_w, orig_h)
-        )
-        try:
-            for frame_idx, frame_rgb in enumerate(orig_frames):
-                data = per_frame.get(frame_idx)
-                if data is None or not data["objects"]:
-                    overlay = draw_overlay(
-                        frame_rgb, None, None, args.obj_id, frame_idx
-                    )
-                else:
-                    obj = data["objects"][0]
-                    mask_bool = data["masks"][0].astype(bool)
-                    if mask_bool.shape != frame_rgb.shape[:2]:
-                        mask_bool = cv2.resize(
-                            mask_bool.astype(np.uint8),
-                            (frame_rgb.shape[1], frame_rgb.shape[0]),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                    overlay = draw_overlay(
-                        frame_rgb,
-                        mask_bool,
-                        obj["bbox_xyxy_pixels"],
-                        obj["obj_id"],
-                        frame_idx,
-                    )
-                writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        finally:
-            writer.release()
         print(f"Saved overlay video to {args.overlay_video}")
 
 
