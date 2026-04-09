@@ -443,7 +443,10 @@ def _create_tracker_transformer():
 
 
 def build_tracker(
-    apply_temporal_disambiguation: bool, with_backbone: bool = False, compile_mode=None
+    apply_temporal_disambiguation: bool,
+    with_backbone: bool = False,
+    compile_mode=None,
+    trim_past_non_cond_mem: bool = False,
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -471,7 +474,7 @@ def build_tracker(
         multimask_output_in_sam=True,
         # Evaluation
         forward_backbone_per_frame_for_eval=True,
-        trim_past_non_cond_mem_for_eval=False,
+        trim_past_non_cond_mem_for_eval=trim_past_non_cond_mem,
         # Multimask
         multimask_output_for_tracking=True,
         multimask_min_pt_num=0,
@@ -501,6 +504,7 @@ def build_sam3_tracker_only(
     checkpoint_path: Optional[str] = None,
     load_from_HF: bool = True,
     apply_temporal_disambiguation: bool = False,
+    trim_past_memory: bool = False,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile_mode=None,
 ) -> Sam3TrackerPredictor:
@@ -531,6 +535,9 @@ def build_sam3_tracker_only(
         apply_temporal_disambiguation: Enables SAM2Long-style memory selection in
             the tracker. Defaults to ``False`` (matches the tracker used in the
             instance-interactive image predictor and in SAM 2 VOS-like usage).
+        trim_past_memory: If ``True``, discard memory features from frames that
+            have fallen outside the attention window (``num_maskmem`` frames back).
+            Recommended for long forward-only tracking to bound GPU/CPU memory.
         device: Device to place the model on.
         compile_mode: Optional ``torch.compile`` mode string for the vision trunk.
 
@@ -542,6 +549,7 @@ def build_sam3_tracker_only(
         apply_temporal_disambiguation=apply_temporal_disambiguation,
         with_backbone=True,
         compile_mode=compile_mode,
+        trim_past_non_cond_mem=trim_past_memory,
     )
 
     if load_from_HF and checkpoint_path is None:

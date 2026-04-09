@@ -165,6 +165,15 @@ def parse_args() -> argparse.Namespace:
             "memory at the cost of a small per-frame transfer overhead."
         ),
     )
+    parser.add_argument(
+        "--trim-memory",
+        action="store_true",
+        help=(
+            "Discard memory features from frames that have fallen outside the "
+            "tracker's attention window. Keeps GPU/CPU memory bounded for "
+            "forward-only tracking on very long videos."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -305,6 +314,7 @@ def main() -> None:
     predictor = build_sam3_tracker_only(
         checkpoint_path=args.checkpoint,
         apply_temporal_disambiguation=args.apply_temporal_disambiguation,
+        trim_past_memory=args.trim_memory,
         device=args.device,
     )
 
