@@ -39,6 +39,65 @@ from PIL import Image
 from sam3.model_builder import build_sam3_tracker_only
 
 
+class LazyVideoFrameLoader:
+    """Load and normalize video frames on demand — one at a time.
+
+    Unlike the default ``load_video_frames`` which materializes every frame into
+    a single tensor (tens of GB for long videos), this loader reads each frame
+    from disk only when ``__getitem__`` is called, and does **not** cache it.
+    Memory usage is O(1) regardless of video length.
+
+    Supports MP4 files (via ``decord``) and JPEG folders.
+    """
+
+    def __init__(self, video_path: str, image_size: int = 1008):
+        self.image_size = image_size
+        self._img_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)[:, None, None]
+        self._img_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)[:, None, None]
+
+        if os.path.isdir(video_path):
+            self._mode = "jpeg"
+            jpg_exts = (".jpg", ".jpeg", ".JPG", ".JPEG")
+            names = [p for p in os.listdir(video_path) if p.endswith(jpg_exts)]
+            if not names:
+                raise RuntimeError(f"No JPEG frames in {video_path}")
+            names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+            self._img_paths = [os.path.join(video_path, n) for n in names]
+            # Read first frame for dimensions
+            first = Image.open(self._img_paths[0])
+            self.video_width, self.video_height = first.size
+            self._num_frames = len(self._img_paths)
+        else:
+            self._mode = "mp4"
+            import decord
+            decord.bridge.set_bridge("torch")
+            self._video_path = video_path
+            vr = decord.VideoReader(video_path)
+            first_frame = vr[0]
+            self.video_height, self.video_width = first_frame.shape[:2]
+            self._num_frames = len(vr)
+            del vr
+
+    def __len__(self):
+        return self._num_frames
+
+    def __getitem__(self, index):
+        if self._mode == "jpeg":
+            img_pil = Image.open(self._img_paths[index]).convert("RGB")
+            img_pil = img_pil.resize((self.image_size, self.image_size))
+            img = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float() / 255.0
+        else:
+            import decord
+            decord.bridge.set_bridge("torch")
+            vr = decord.VideoReader(
+                self._video_path, width=self.image_size, height=self.image_size
+            )
+            img = vr[index].permute(2, 0, 1).float() / 255.0
+            del vr
+        img = (img - self._img_mean) / self._img_std
+        return img
+
+
 def _import_cv2():
     """Lazy-import cv2 so the core tracking path works without it."""
     try:
@@ -172,6 +231,15 @@ def parse_args() -> argparse.Namespace:
             "Discard heavy spatial memory features from frames outside the "
             "attention window. Object pointers (256-d) are always kept. "
             "Recommended for forward-only tracking on very long videos."
+        ),
+    )
+    parser.add_argument(
+        "--lazy-load",
+        action="store_true",
+        help=(
+            "Load video frames one at a time from disk instead of all at once. "
+            "Essential for long videos (thousands of frames) that would "
+            "otherwise exhaust RAM. Slightly slower per frame due to disk I/O."
         ),
     )
     parser.add_argument(
@@ -332,11 +400,22 @@ def main() -> None:
     )
 
     print(f"Initializing inference state from: {args.video}")
-    inference_state = predictor.init_state(
-        video_path=args.video,
-        offload_video_to_cpu=args.offload_video_to_cpu,
-        offload_state_to_cpu=args.offload_to_cpu,
-    )
+    if args.lazy_load:
+        # Lazy loading: read one frame at a time from disk (O(1) memory).
+        loader = LazyVideoFrameLoader(args.video, image_size=predictor.image_size)
+        inference_state = predictor.init_state(
+            video_height=loader.video_height,
+            video_width=loader.video_width,
+            num_frames=len(loader),
+            offload_state_to_cpu=args.offload_to_cpu,
+        )
+        inference_state["images"] = loader
+    else:
+        inference_state = predictor.init_state(
+            video_path=args.video,
+            offload_video_to_cpu=args.offload_video_to_cpu,
+            offload_state_to_cpu=args.offload_to_cpu,
+        )
     video_h = inference_state["video_height"]
     video_w = inference_state["video_width"]
     num_frames = inference_state["num_frames"]
