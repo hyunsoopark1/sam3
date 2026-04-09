@@ -148,6 +148,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable SAM2Long-style memory selection inside the tracker.",
     )
+    parser.add_argument(
+        "--offload-to-cpu",
+        action="store_true",
+        help=(
+            "Offload per-frame tracking state (memory features, mask logits) "
+            "to CPU RAM. Essential for long videos (thousands of frames) to "
+            "avoid GPU OOM. Slightly slower due to CPU<->GPU transfers."
+        ),
+    )
+    parser.add_argument(
+        "--offload-video-to-cpu",
+        action="store_true",
+        help=(
+            "Keep decoded video frames in CPU RAM instead of GPU. Saves GPU "
+            "memory at the cost of a small per-frame transfer overhead."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -292,7 +309,11 @@ def main() -> None:
     )
 
     print(f"Initializing inference state from: {args.video}")
-    inference_state = predictor.init_state(video_path=args.video)
+    inference_state = predictor.init_state(
+        video_path=args.video,
+        offload_video_to_cpu=args.offload_video_to_cpu,
+        offload_state_to_cpu=args.offload_to_cpu,
+    )
     video_h = inference_state["video_height"]
     video_w = inference_state["video_width"]
     num_frames = inference_state["num_frames"]
