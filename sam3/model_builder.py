@@ -497,6 +497,89 @@ def build_tracker(
     return model
 
 
+def build_sam3_tracker_only(
+    checkpoint_path: Optional[str] = None,
+    load_from_HF: bool = True,
+    apply_temporal_disambiguation: bool = False,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    compile_mode=None,
+) -> Sam3TrackerPredictor:
+    """
+    Build a standalone SAM 3 tracker that takes a video and prompts (points/boxes/masks)
+    on a frame and tracks the object(s) over the rest of the frames.
+
+    Unlike ``build_sam3_video_model``, this builder does NOT instantiate the detector,
+    the text encoder, the detection transformer, the segmentation head, or the
+    detection-side geometry encoder. The resulting model contains only the parts
+    strictly required for mask propagation:
+
+      - A vision-only backbone (ViT + dual neck; the neck's SAM-2 branch is what the
+        tracker actually consumes).
+      - The Sam3TrackerPredictor itself (memory encoder, memory-conditioned
+        transformer, SAM-style prompt encoder, and SAM-style mask decoder).
+
+    When loading from the released SAM 3 checkpoint, only the ``tracker.*`` and the
+    ``detector.backbone.vision_backbone.*`` entries are used; all other keys
+    (language backbone, detector transformer, segmentation head, etc.) are ignored.
+
+    Args:
+        checkpoint_path: Optional local path to a SAM 3 checkpoint. If ``None`` and
+            ``load_from_HF`` is ``True``, the ``sam3.pt`` checkpoint is downloaded
+            from Hugging Face.
+        load_from_HF: Whether to automatically download the checkpoint from HF when
+            ``checkpoint_path`` is ``None``.
+        apply_temporal_disambiguation: Enables SAM2Long-style memory selection in
+            the tracker. Defaults to ``False`` (matches the tracker used in the
+            instance-interactive image predictor and in SAM 2 VOS-like usage).
+        device: Device to place the model on.
+        compile_mode: Optional ``torch.compile`` mode string for the vision trunk.
+
+    Returns:
+        Sam3TrackerPredictor ready to be used like in the SAM 2 VOS notebook
+        (``init_state`` -> ``add_new_points_or_box`` -> ``propagate_in_video``).
+    """
+    tracker = build_tracker(
+        apply_temporal_disambiguation=apply_temporal_disambiguation,
+        with_backbone=True,
+        compile_mode=compile_mode,
+    )
+
+    if load_from_HF and checkpoint_path is None:
+        checkpoint_path = download_ckpt_from_hf(version="sam3")
+
+    if checkpoint_path is not None:
+        with g_pathmgr.open(checkpoint_path, "rb") as f:
+            ckpt = torch.load(f, map_location="cpu", weights_only=True)
+        if "model" in ckpt and isinstance(ckpt["model"], dict):
+            ckpt = ckpt["model"]
+
+        tracker_prefix = "tracker."
+        vision_prefix = "detector.backbone.vision_backbone."
+        remapped_ckpt = {}
+        for k, v in ckpt.items():
+            if k.startswith(tracker_prefix):
+                remapped_ckpt[k[len(tracker_prefix):]] = v
+            elif k.startswith(vision_prefix):
+                remapped_ckpt[
+                    "backbone.vision_backbone." + k[len(vision_prefix):]
+                ] = v
+            # Everything else (language backbone, detector transformer,
+            # segmentation head, dot-product scoring, geometry encoder, etc.)
+            # belongs to the detector and is intentionally dropped.
+
+        missing_keys, unexpected_keys = tracker.load_state_dict(
+            remapped_ckpt, strict=False
+        )
+        if missing_keys:
+            print(f"[build_sam3_tracker_only] missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"[build_sam3_tracker_only] unexpected keys: {unexpected_keys}")
+
+    tracker.to(device=device)
+    tracker.eval()
+    return tracker
+
+
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     """Create SAM3 text encoder."""
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
