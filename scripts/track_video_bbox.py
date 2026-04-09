@@ -169,9 +169,21 @@ def parse_args() -> argparse.Namespace:
         "--trim-memory",
         action="store_true",
         help=(
-            "Discard memory features from frames that have fallen outside the "
-            "tracker's attention window. Keeps GPU/CPU memory bounded for "
-            "forward-only tracking on very long videos."
+            "Discard heavy spatial memory features from frames outside the "
+            "attention window. Object pointers (256-d) are always kept. "
+            "Recommended for forward-only tracking on very long videos."
+        ),
+    )
+    parser.add_argument(
+        "--max-obj-ptrs",
+        type=int,
+        default=16,
+        help=(
+            "Number of past frames whose object pointers are attended to. "
+            "Default: 16. Increase for long-range re-identification (e.g. "
+            "object disappears and reappears after hundreds of frames). "
+            "Each pointer is 256-d so memory cost is negligible; main cost "
+            "is cross-attention over more tokens."
         ),
     )
     return parser.parse_args()
@@ -315,6 +327,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         apply_temporal_disambiguation=args.apply_temporal_disambiguation,
         trim_past_memory=args.trim_memory,
+        max_obj_ptrs_in_encoder=args.max_obj_ptrs,
         device=args.device,
     )
 

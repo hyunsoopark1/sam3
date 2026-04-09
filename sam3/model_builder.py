@@ -447,6 +447,7 @@ def build_tracker(
     with_backbone: bool = False,
     compile_mode=None,
     trim_past_non_cond_mem: bool = False,
+    max_obj_ptrs_in_encoder: int = 16,
 ) -> Sam3TrackerPredictor:
     """
     Build the SAM3 Tracker module for video tracking.
@@ -485,6 +486,7 @@ def build_tracker(
         non_overlap_masks_for_mem_enc=False,
         non_overlap_masks_for_output=False,
         max_cond_frames_in_attn=4,
+        max_obj_ptrs_in_encoder=max_obj_ptrs_in_encoder,
         offload_output_to_cpu_for_eval=False,
         # SAM decoder settings
         sam_mask_decoder_extra_args={
@@ -505,6 +507,7 @@ def build_sam3_tracker_only(
     load_from_HF: bool = True,
     apply_temporal_disambiguation: bool = False,
     trim_past_memory: bool = False,
+    max_obj_ptrs_in_encoder: int = 16,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile_mode=None,
 ) -> Sam3TrackerPredictor:
@@ -537,7 +540,13 @@ def build_sam3_tracker_only(
             instance-interactive image predictor and in SAM 2 VOS-like usage).
         trim_past_memory: If ``True``, discard memory features from frames that
             have fallen outside the attention window (``num_maskmem`` frames back).
-            Recommended for long forward-only tracking to bound GPU/CPU memory.
+            Object pointers are always preserved. Recommended for long
+            forward-only tracking to bound GPU/CPU memory.
+        max_obj_ptrs_in_encoder: How many past frames' object pointers to attend
+            to.  Default is 16.  Increase for long-range re-identification (e.g.
+            a person disappearing and reappearing). Each pointer is only a 256-d
+            vector, so the overhead is small — the cost is the cross-attention
+            over more tokens.
         device: Device to place the model on.
         compile_mode: Optional ``torch.compile`` mode string for the vision trunk.
 
@@ -550,6 +559,7 @@ def build_sam3_tracker_only(
         with_backbone=True,
         compile_mode=compile_mode,
         trim_past_non_cond_mem=trim_past_memory,
+        max_obj_ptrs_in_encoder=max_obj_ptrs_in_encoder,
     )
 
     if load_from_HF and checkpoint_path is None:
