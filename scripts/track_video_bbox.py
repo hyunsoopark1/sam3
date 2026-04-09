@@ -32,11 +32,24 @@ import json
 import os
 from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 from sam3.model_builder import build_sam3_tracker_only
+
+
+def _import_cv2():
+    """Lazy-import cv2 so the core tracking path works without it."""
+    try:
+        import cv2
+
+        return cv2
+    except ModuleNotFoundError:
+        raise ModuleNotFoundError(
+            "opencv-python (cv2) is required for --overlay-video and "
+            "--output-masks.  Install it with:  pip install opencv-python"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,6 +201,7 @@ def iter_frames_from_video(video_path: str) -> Tuple[int, int, float, List[np.nd
     Used only to redraw overlays on top of the original frames; the tracker
     itself loads its own copy through ``init_state``.
     """
+    cv2 = _import_cv2()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video file: {video_path}")
@@ -214,10 +228,8 @@ def iter_frames_from_jpeg_folder(folder: str) -> Tuple[int, int, float, List[np.
     names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     frames: List[np.ndarray] = []
     for name in names:
-        img_bgr = cv2.imread(os.path.join(folder, name))
-        if img_bgr is None:
-            raise RuntimeError(f"Failed to read {name} from {folder}")
-        frames.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        img = Image.open(os.path.join(folder, name)).convert("RGB")
+        frames.append(np.array(img))
     h, w = frames[0].shape[:2]
     return w, h, 10.0, frames
 
@@ -236,6 +248,7 @@ def draw_overlay(
     frame_idx: int,
 ) -> np.ndarray:
     """Return an RGB overlay with the mask (cyan tint) and bbox (green) drawn."""
+    cv2 = _import_cv2()
     overlay = frame_rgb.copy()
     if mask is not None and mask.any():
         color = np.array([0, 255, 255], dtype=np.uint8)  # cyan
@@ -368,18 +381,19 @@ def main() -> None:
     if args.output_masks is not None:
         os.makedirs(args.output_masks, exist_ok=True)
         for idx, data in sorted(per_frame.items()):
-            # Single-object seed -> one mask per frame is enough; still prefix
-            # with obj id in case we later extend to multi-object tracking.
             for i, obj in enumerate(data["objects"]):
                 mask_bool = data["masks"][i]
                 png_path = os.path.join(
                     args.output_masks,
                     f"frame{idx:06d}_obj{obj['obj_id']}.png",
                 )
-                cv2.imwrite(png_path, (mask_bool.astype(np.uint8) * 255))
+                Image.fromarray(mask_bool.astype(np.uint8) * 255, mode="L").save(
+                    png_path
+                )
         print(f"Saved per-frame masks to {args.output_masks}")
 
     if args.overlay_video is not None:
+        cv2 = _import_cv2()
         print("Loading original frames for overlay rendering...")
         orig_w, orig_h, fps, orig_frames = load_original_frames(args.video)
         if (orig_w, orig_h) != (video_w, video_h):
@@ -402,8 +416,6 @@ def main() -> None:
                         frame_rgb, None, None, args.obj_id, frame_idx
                     )
                 else:
-                    # Single-object assumption for the overlay (we seeded only
-                    # one box); if multiple objects were tracked, pick obj 0.
                     obj = data["objects"][0]
                     mask_bool = data["masks"][0].astype(bool)
                     if mask_bool.shape != frame_rgb.shape[:2]:
