@@ -450,23 +450,30 @@ def main() -> None:
         os.makedirs(mask_dir, exist_ok=True)
 
     overlay_writer = None
-    overlay_frames_source = None
+    overlay_frame_reader = None
+    overlay_w, overlay_h, overlay_fps = video_w, video_h, 30.0
     cv2_mod = None
     if args.overlay_video is not None:
         cv2_mod = _import_cv2()
-        print("Loading original frames for overlay rendering...")
-        orig_w, orig_h, fps, overlay_frames_source = load_original_frames(args.video)
-        if (orig_w, orig_h) != (video_w, video_h):
-            print(
-                f"  note: overlay frame size {orig_w}x{orig_h} differs from "
-                f"tracker-reported {video_w}x{video_h}; using overlay size."
-            )
+        # Open video for per-frame reading (no bulk load).
+        if os.path.isdir(args.video):
+            overlay_frame_reader = ("jpeg", args.video)
+            overlay_w, overlay_h = video_w, video_h
+            overlay_fps = 10.0
+        else:
+            cap = cv2_mod.VideoCapture(args.video)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video for overlay: {args.video}")
+            overlay_fps = cap.get(cv2_mod.CAP_PROP_FPS) or 30.0
+            overlay_w = int(cap.get(cv2_mod.CAP_PROP_FRAME_WIDTH))
+            overlay_h = int(cap.get(cv2_mod.CAP_PROP_FRAME_HEIGHT))
+            overlay_frame_reader = ("mp4", cap)
         os.makedirs(
             os.path.dirname(os.path.abspath(args.overlay_video)), exist_ok=True
         )
         fourcc = cv2_mod.VideoWriter_fourcc(*"mp4v")
         overlay_writer = cv2_mod.VideoWriter(
-            args.overlay_video, fourcc, fps, (orig_w, orig_h)
+            args.overlay_video, fourcc, overlay_fps, (overlay_w, overlay_h)
         )
 
     print("Propagating mask through the video...")
@@ -511,9 +518,29 @@ def main() -> None:
                         mask_bool.astype(np.uint8) * 255, mode="L"
                     ).save(png_path)
 
-            # Stream overlay frames to video writer immediately
-            if overlay_writer is not None and overlay_frames_source is not None:
-                frame_rgb = overlay_frames_source[frame_idx]
+            # Stream overlay frame to video writer (read one frame at a time)
+            if overlay_writer is not None and overlay_frame_reader is not None:
+                reader_type, reader = overlay_frame_reader
+                if reader_type == "mp4":
+                    ok, frame_bgr = reader.read()
+                    frame_rgb = (
+                        cv2_mod.cvtColor(frame_bgr, cv2_mod.COLOR_BGR2RGB)
+                        if ok
+                        else np.zeros((overlay_h, overlay_w, 3), dtype=np.uint8)
+                    )
+                else:
+                    jpg_exts = (".jpg", ".jpeg", ".JPG", ".JPEG")
+                    names = sorted(
+                        [p for p in os.listdir(reader) if p.endswith(jpg_exts)],
+                        key=lambda p: int(os.path.splitext(p)[0]),
+                    )
+                    if frame_idx < len(names):
+                        frame_rgb = np.array(
+                            Image.open(os.path.join(reader, names[frame_idx])).convert("RGB")
+                        )
+                    else:
+                        frame_rgb = np.zeros((overlay_h, overlay_w, 3), dtype=np.uint8)
+
                 obj = frame_entries[0] if frame_entries else None
                 if obj is not None and obj["present"]:
                     mask_bool = masks_np[0].astype(bool)
@@ -541,6 +568,10 @@ def main() -> None:
     finally:
         if overlay_writer is not None:
             overlay_writer.release()
+        if overlay_frame_reader is not None:
+            reader_type, reader = overlay_frame_reader
+            if reader_type == "mp4" and hasattr(reader, "release"):
+                reader.release()
 
     print(f"Tracked {len(json_results)} frames.")
 
