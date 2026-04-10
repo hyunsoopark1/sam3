@@ -39,7 +39,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from sam3.model_builder import build_sam3_tracker_only
+from sam3.model_builder import build_sam3_image_model, build_sam3_tracker_only
 
 # ---------------------------------------------------------------------------
 # Colors for up to 20 persons (RGB).  Wraps around for more.
@@ -179,34 +179,65 @@ class OriginalFrameReader:
 
 
 # ---------------------------------------------------------------------------
-# Person detector (torchvision Faster R-CNN)
+# Person detector (SAM3 DETR with text prompt)
 # ---------------------------------------------------------------------------
 class PersonDetector:
-    """Detect persons using torchvision Faster R-CNN (COCO class 1)."""
+    """Detect persons using the SAM3 DETR detector with text prompt 'person'.
 
-    def __init__(self, device: str = "cuda", score_threshold: float = 0.5):
-        from torchvision.models.detection import (
-            fasterrcnn_resnet50_fpn_v2,
-            FasterRCNN_ResNet50_FPN_V2_Weights,
+    This shares the same ViT backbone architecture as the tracker (though the
+    weights are loaded into a separate module instance).  The SAM3 detector
+    produces both bounding boxes *and* segmentation masks, which are used
+    directly to initialise tracker states — giving better masks than a
+    bbox-only detector.
+    """
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        score_threshold: float = 0.5,
+        checkpoint_path: Optional[str] = None,
+        prompt: str = "person",
+    ):
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        image_model = build_sam3_image_model(
+            device=device,
+            checkpoint_path=checkpoint_path,
+            enable_segmentation=True,
+            enable_inst_interactivity=False,
         )
-
-        weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-        self.model = fasterrcnn_resnet50_fpn_v2(weights=weights)
-        self.model.to(device).eval()
-        self.score_threshold = score_threshold
+        self.processor = Sam3Processor(
+            image_model,
+            device=device,
+            confidence_threshold=score_threshold,
+        )
+        self.prompt = prompt
         self.device = device
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def detect(self, frame_rgb: np.ndarray) -> List[Dict]:
-        """Return list of ``{"bbox_xyxy": [x1,y1,x2,y2], "score": float}``."""
-        img = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
-        img = img.unsqueeze(0).to(self.device)
-        out = self.model(img)[0]
+        """Detect persons in an RGB frame.
+
+        Returns list of ``{"bbox_xyxy": [...], "mask": np.ndarray, "score": float}``.
+        """
+        pil_img = Image.fromarray(frame_rgb)
+        state = self.processor.set_image(pil_img)
+        state = self.processor.set_text_prompt(self.prompt, state)
+
         persons = []
-        for i in range(len(out["labels"])):
-            if out["labels"][i] == 1 and out["scores"][i] > self.score_threshold:
-                box = out["boxes"][i].cpu().numpy().tolist()
-                persons.append({"bbox_xyxy": box, "score": out["scores"][i].item()})
+        if "boxes" not in state or len(state["boxes"]) == 0:
+            return persons
+
+        boxes = state["boxes"].cpu().numpy()       # (N, 4) xyxy pixels
+        scores = state["scores"].cpu().numpy()     # (N,)
+        masks = state["masks"].squeeze(1).cpu().numpy()  # (N, H, W) bool
+
+        for i in range(len(boxes)):
+            persons.append({
+                "bbox_xyxy": boxes[i].tolist(),
+                "mask": masks[i],
+                "score": float(scores[i]),
+            })
         return persons
 
 
@@ -308,28 +339,48 @@ class MultiPersonTracker:
         return state
 
     def add_persons(
-        self, frame_idx: int, bboxes_xyxy_pixels: List[List[float]]
+        self,
+        frame_idx: int,
+        detections: List[Dict],
     ) -> List[int]:
-        """Seed new persons on *frame_idx*. Returns assigned obj_ids."""
-        if not bboxes_xyxy_pixels:
+        """Seed new persons on *frame_idx* using detected masks.
+
+        Each entry in *detections* should have ``"mask"`` (H×W bool array)
+        and ``"bbox_xyxy"`` (pixel coords).  If ``"mask"`` is present it is
+        used directly (better quality from the SAM3 DETR detector); otherwise
+        we fall back to the bounding box.
+
+        Returns assigned obj_ids.
+        """
+        if not detections:
             return []
         state = self._create_state()
         assigned = []
-        for bbox in bboxes_xyxy_pixels:
+        for det in detections:
             oid = self.next_obj_id
             self.next_obj_id += 1
-            x1, y1, x2, y2 = bbox
-            norm = np.array(
-                [[x1 / self.video_w, y1 / self.video_h,
-                  x2 / self.video_w, y2 / self.video_h]],
-                dtype=np.float32,
-            )
-            self.predictor.add_new_points_or_box(
-                inference_state=state,
-                frame_idx=frame_idx,
-                obj_id=oid,
-                box=norm,
-            )
+            mask = det.get("mask")
+            if mask is not None:
+                mask_t = torch.from_numpy(mask.astype(np.float32))
+                self.predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=frame_idx,
+                    obj_id=oid,
+                    mask=mask_t,
+                )
+            else:
+                x1, y1, x2, y2 = det["bbox_xyxy"]
+                norm = np.array(
+                    [[x1 / self.video_w, y1 / self.video_h,
+                      x2 / self.video_w, y2 / self.video_h]],
+                    dtype=np.float32,
+                )
+                self.predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=frame_idx,
+                    obj_id=oid,
+                    box=norm,
+                )
             assigned.append(oid)
         self.predictor.propagate_in_video_preflight(state)
         self.tracker_states.append(state)
@@ -574,7 +625,7 @@ def main():
     args = parse_args()
 
     # ---- Build models ----
-    print("Building SAM 3 tracker (no detector)...")
+    print("Building SAM 3 tracker...")
     predictor = build_sam3_tracker_only(
         checkpoint_path=args.checkpoint,
         trim_past_memory=args.trim_memory,
@@ -582,9 +633,11 @@ def main():
         device=args.device,
     )
 
-    print("Loading person detector (Faster R-CNN)...")
+    print("Building SAM 3 person detector (DETR with 'person' prompt)...")
     detector = PersonDetector(
-        device=args.device, score_threshold=args.det_score_threshold
+        device=args.device,
+        score_threshold=args.det_score_threshold,
+        checkpoint_path=args.checkpoint,
     )
 
     # ---- Video setup ----
@@ -655,8 +708,8 @@ def main():
 
                 # Step 4: Create new tracks for unmatched detections
                 if unmatched_idxs:
-                    new_bboxes = [det_bboxes[i] for i in unmatched_idxs]
-                    new_ids = tracker.add_persons(frame_idx, new_bboxes)
+                    new_dets = [detections[i] for i in unmatched_idxs]
+                    new_ids = tracker.add_persons(frame_idx, new_dets)
                     # Propagate the new state for this frame to get initial masks
                     new_tracked = tracker.propagate_frame_last_state(frame_idx)
                     tracked.update(new_tracked)
