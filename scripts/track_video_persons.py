@@ -338,57 +338,50 @@ class MultiPersonTracker:
     def _evict_old_outputs(self, frame_idx: int):
         """Strip stored outputs to only what the tracker actually reads.
 
-        Kept per frame:
-          - ``maskmem_features`` — spatial memory, last ``num_maskmem`` frames
-          - ``maskmem_pos_enc``  — goes with maskmem_features
-          - ``obj_ptr``          — object pointer, last ``max_obj_ptrs_in_encoder`` frames
+        Two independent windows:
+          - Spatial memory window (``num_maskmem`` frames, default 7):
+            keep ``maskmem_features`` + ``maskmem_pos_enc``
+          - Pointer window (``max_obj_ptrs_in_encoder`` frames):
+            keep ``obj_ptr`` only (1 KB each)
 
-        Deleted immediately (never read again in forward-only tracking):
-          - ``pred_masks``
-          - ``object_score_logits``
-          - ``iou_score`` / ``eff_iou_score``
-
-        Fully deleted when outside the attention window:
-          - entire entry (all fields including maskmem_features and obj_ptr)
+        Outside spatial window → drop maskmem_features/maskmem_pos_enc.
+        Outside pointer window → drop obj_ptr.
+        Outside both → delete the entire entry.
+        Always drop: pred_masks, object_score_logits, iou_score.
         """
         mem_cutoff = frame_idx - self.predictor.num_maskmem - 1
         ptr_cutoff = frame_idx - self.predictor.max_obj_ptrs_in_encoder - 1
 
         for state in self.tracker_states:
-            for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                d = state["output_dict"][key]
-                to_del = []
-                for t, out in d.items():
-                    if t >= frame_idx:
-                        continue
-                    if t < min(mem_cutoff, ptr_cutoff):
-                        # Outside both windows — delete entirely
-                        to_del.append(t)
-                    else:
-                        # Inside a window — strip unneeded fields
-                        for drop_key in (
-                            "pred_masks", "object_score_logits",
-                            "iou_score", "eff_iou_score",
-                        ):
-                            out.pop(drop_key, None)
-                for t in to_del:
-                    del d[t]
-
-            for obj_dict in state["output_dict_per_obj"].values():
+            all_dicts = [state["output_dict"]] + list(
+                state["output_dict_per_obj"].values()
+            )
+            for state_dict in all_dicts:
                 for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                    d = obj_dict[key]
+                    d = state_dict[key]
                     to_del = []
                     for t, out in d.items():
                         if t >= frame_idx:
                             continue
-                        if t < min(mem_cutoff, ptr_cutoff):
+                        # Always strip these (never read in forward-only)
+                        for drop in (
+                            "pred_masks", "object_score_logits",
+                            "iou_score", "eff_iou_score",
+                        ):
+                            out.pop(drop, None)
+                        # Drop spatial memory outside its window
+                        if t < mem_cutoff:
+                            out.pop("maskmem_features", None)
+                            out.pop("maskmem_pos_enc", None)
+                        # Drop obj_ptr outside its window
+                        if t < ptr_cutoff:
+                            out.pop("obj_ptr", None)
+                        # If nothing useful left, mark for full deletion
+                        if not any(
+                            k in out
+                            for k in ("maskmem_features", "obj_ptr")
+                        ):
                             to_del.append(t)
-                        else:
-                            for drop_key in (
-                                "pred_masks", "object_score_logits",
-                                "iou_score", "eff_iou_score",
-                            ):
-                                out.pop(drop_key, None)
                     for t in to_del:
                         del d[t]
 

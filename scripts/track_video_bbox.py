@@ -566,13 +566,12 @@ def main() -> None:
             # Only keep lightweight metadata — no masks in memory
             json_results[int(frame_idx)] = frame_entries
 
-            # Strip unneeded fields and evict old entries outside the
-            # attention window.  Keep only maskmem_features (spatial memory,
-            # last num_maskmem frames), maskmem_pos_enc, and obj_ptr (last
-            # max_obj_ptrs_in_encoder frames).
+            # Two independent eviction windows:
+            #   spatial memory (maskmem_features): last num_maskmem frames
+            #   object pointers (obj_ptr):         last max_obj_ptrs frames
+            # Everything else is dropped immediately.
             mem_cutoff = frame_idx - predictor.num_maskmem - 1
             ptr_cutoff = frame_idx - predictor.max_obj_ptrs_in_encoder - 1
-            full_cutoff = min(mem_cutoff, ptr_cutoff)
             for state_dict in [inference_state["output_dict"]] + list(
                 inference_state["output_dict_per_obj"].values()
             ):
@@ -582,14 +581,20 @@ def main() -> None:
                     for t, out in d.items():
                         if t >= frame_idx:
                             continue
-                        if t < full_cutoff:
+                        for drop in (
+                            "pred_masks", "object_score_logits",
+                            "iou_score", "eff_iou_score",
+                        ):
+                            out.pop(drop, None)
+                        if t < mem_cutoff:
+                            out.pop("maskmem_features", None)
+                            out.pop("maskmem_pos_enc", None)
+                        if t < ptr_cutoff:
+                            out.pop("obj_ptr", None)
+                        if not any(
+                            k in out for k in ("maskmem_features", "obj_ptr")
+                        ):
                             to_del.append(t)
-                        else:
-                            for drop_key in (
-                                "pred_masks", "object_score_logits",
-                                "iou_score", "eff_iou_score",
-                            ):
-                                out.pop(drop_key, None)
                     for t in to_del:
                         del d[t]
 
