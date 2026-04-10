@@ -576,21 +576,22 @@ def main() -> None:
             for state_dict in [inference_state["output_dict"]] + list(
                 inference_state["output_dict_per_obj"].values()
             ):
-                for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                    d = state_dict[key]
-                    to_del = []
-                    for t, out in d.items():
-                        if t >= frame_idx:
-                            continue
-                        for drop in (
-                            "pred_masks", "object_score_logits",
-                            "iou_score", "eff_iou_score",
-                        ):
-                            out.pop(drop, None)
-                        if t < mem_cutoff:
-                            to_del.append(t)
-                    for t in to_del:
-                        del d[t]
+                # Never evict cond_frame_outputs — the tracker requires at
+                # least one conditioning frame and reads its maskmem_features.
+                d = state_dict["non_cond_frame_outputs"]
+                to_del = []
+                for t, out in d.items():
+                    if t >= frame_idx:
+                        continue
+                    for drop in (
+                        "pred_masks", "object_score_logits",
+                        "iou_score", "eff_iou_score",
+                    ):
+                        out.pop(drop, None)
+                    if t < mem_cutoff:
+                        to_del.append(t)
+                for t in to_del:
+                    del d[t]
 
     finally:
         if overlay_writer is not None:

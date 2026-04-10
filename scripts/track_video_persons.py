@@ -363,25 +363,23 @@ class MultiPersonTracker:
                 state["output_dict_per_obj"].values()
             )
             for state_dict in all_dicts:
-                for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                    d = state_dict[key]
-                    to_del = []
-                    for t, out in d.items():
-                        if t >= frame_idx:
-                            continue
-                        # Always strip fields never read in forward-only
-                        for drop in (
-                            "pred_masks", "object_score_logits",
-                            "iou_score", "eff_iou_score",
-                        ):
-                            out.pop(drop, None)
-                        # Outside spatial window: delete entire entry
-                        # (tracker crashes if entry exists without
-                        #  maskmem_features, so we must remove it fully)
-                        if t < mem_cutoff:
-                            to_del.append(t)
-                    for t in to_del:
-                        del d[t]
+                # Never evict cond_frame_outputs — the tracker requires at
+                # least one conditioning frame to exist and reads its
+                # maskmem_features.  There's typically just 1 per state.
+                d = state_dict["non_cond_frame_outputs"]
+                to_del = []
+                for t, out in d.items():
+                    if t >= frame_idx:
+                        continue
+                    for drop in (
+                        "pred_masks", "object_score_logits",
+                        "iou_score", "eff_iou_score",
+                    ):
+                        out.pop(drop, None)
+                    if t < mem_cutoff:
+                        to_del.append(t)
+                for t in to_del:
+                    del d[t]
 
     def propagate_frame(self, frame_idx: int) -> Dict[int, Dict]:
         """Propagate all states one frame. Returns {obj_id: info_dict}."""
