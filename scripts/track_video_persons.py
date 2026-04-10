@@ -208,9 +208,9 @@ class PersonDetector:
         if "boxes" not in state or len(state["boxes"]) == 0:
             return persons
 
-        boxes = state["boxes"].cpu().numpy()       # (N, 4) xyxy pixels
-        scores = state["scores"].cpu().numpy()     # (N,)
-        masks = state["masks"].squeeze(1).cpu().numpy()  # (N, H, W) bool
+        boxes = state["boxes"].float().cpu().numpy()       # (N, 4) xyxy pixels
+        scores = state["scores"].float().cpu().numpy()     # (N,)
+        masks = state["masks"].squeeze(1).cpu().numpy()    # (N, H, W) bool
 
         for i in range(len(boxes)):
             persons.append({
