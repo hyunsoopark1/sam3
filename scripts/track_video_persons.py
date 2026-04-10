@@ -1,0 +1,662 @@
+"""
+Multi-person detection and tracking using the SAM 3 tracker.
+
+Detects persons on every Nth frame using torchvision Faster R-CNN, matches
+them to existing tracks via bbox IoU, and creates new tracker states for
+unmatched detections.  The SAM 3 tracker's memory (object pointers) handles
+long-range re-identification — a person who disappears and reappears can be
+re-associated by the tracker's attention over stored object pointers.
+
+Each "tracker state" corresponds to a batch of persons first detected on the
+same frame.  Multiple states are propagated independently, following the same
+pattern used internally by SAM 3's joint detect-and-track pipeline.
+
+Examples
+--------
+Detect & track all persons, output overlay::
+
+    python scripts/track_video_persons.py \\
+        --video shea.mp4 \\
+        --lazy-load --trim-memory --max-obj-ptrs 256 \\
+        --overlay-video /tmp/persons.mp4
+
+Detect every 10th frame (faster), also save JSON::
+
+    python scripts/track_video_persons.py \\
+        --video shea.mp4 --detect-every 10 \\
+        --lazy-load --trim-memory \\
+        --output-json /tmp/persons.json \\
+        --overlay-video /tmp/persons.mp4
+"""
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+from sam3.model_builder import build_sam3_tracker_only
+
+# ---------------------------------------------------------------------------
+# Colors for up to 20 persons (RGB).  Wraps around for more.
+# ---------------------------------------------------------------------------
+PERSON_COLORS = [
+    (230, 25, 75),
+    (60, 180, 75),
+    (255, 225, 25),
+    (0, 130, 200),
+    (245, 130, 48),
+    (145, 30, 180),
+    (70, 240, 240),
+    (240, 50, 230),
+    (210, 245, 60),
+    (250, 190, 212),
+    (0, 128, 128),
+    (220, 190, 255),
+    (170, 110, 40),
+    (255, 250, 200),
+    (128, 0, 0),
+    (170, 255, 195),
+    (128, 128, 0),
+    (255, 215, 180),
+    (0, 0, 128),
+    (128, 128, 128),
+]
+
+
+def color_for_id(obj_id: int) -> Tuple[int, int, int]:
+    return PERSON_COLORS[obj_id % len(PERSON_COLORS)]
+
+
+# ---------------------------------------------------------------------------
+# Lazy video frame loader (same as track_video_bbox.py)
+# ---------------------------------------------------------------------------
+class LazyVideoFrameLoader:
+    """Load and normalize video frames on demand — O(1) memory."""
+
+    def __init__(self, video_path: str, image_size: int = 1008):
+        self.image_size = image_size
+        self._img_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)[
+            :, None, None
+        ]
+        self._img_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)[
+            :, None, None
+        ]
+        if os.path.isdir(video_path):
+            self._mode = "jpeg"
+            jpg_exts = (".jpg", ".jpeg", ".JPG", ".JPEG")
+            names = [p for p in os.listdir(video_path) if p.endswith(jpg_exts)]
+            if not names:
+                raise RuntimeError(f"No JPEG frames in {video_path}")
+            names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+            self._img_paths = [os.path.join(video_path, n) for n in names]
+            first = Image.open(self._img_paths[0])
+            self.video_width, self.video_height = first.size
+            self._num_frames = len(self._img_paths)
+        else:
+            self._mode = "mp4"
+            import decord
+
+            decord.bridge.set_bridge("torch")
+            self._video_path = video_path
+            vr = decord.VideoReader(video_path)
+            first_frame = vr[0]
+            self.video_height, self.video_width = first_frame.shape[:2]
+            self._num_frames = len(vr)
+            del vr
+
+    def __len__(self):
+        return self._num_frames
+
+    def __getitem__(self, index):
+        if self._mode == "jpeg":
+            img_pil = Image.open(self._img_paths[index]).convert("RGB")
+            img_pil = img_pil.resize((self.image_size, self.image_size))
+            img = (
+                torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float() / 255.0
+            )
+        else:
+            import decord
+
+            decord.bridge.set_bridge("torch")
+            vr = decord.VideoReader(
+                self._video_path, width=self.image_size, height=self.image_size
+            )
+            img = vr[index].permute(2, 0, 1).float() / 255.0
+            del vr
+        img = (img - self._img_mean) / self._img_std
+        return img
+
+
+# ---------------------------------------------------------------------------
+# Lazy original-resolution frame reader (for overlay & detection)
+# ---------------------------------------------------------------------------
+class OriginalFrameReader:
+    """Read original-resolution RGB frames one at a time."""
+
+    def __init__(self, video_path: str):
+        self.video_path = video_path
+        if os.path.isdir(video_path):
+            self._mode = "jpeg"
+            jpg_exts = (".jpg", ".jpeg", ".JPG", ".JPEG")
+            names = [p for p in os.listdir(video_path) if p.endswith(jpg_exts)]
+            names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+            self._img_paths = [os.path.join(video_path, n) for n in names]
+            first = Image.open(self._img_paths[0])
+            self.width, self.height = first.size
+            self.fps = 10.0
+            self.num_frames = len(self._img_paths)
+        else:
+            import cv2 as _cv2
+
+            cap = _cv2.VideoCapture(video_path)
+            self.width = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+            self.num_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            self._mode = "mp4"
+
+    def read_frame(self, frame_idx: int) -> np.ndarray:
+        """Return RGB uint8 array of shape (H, W, 3)."""
+        if self._mode == "jpeg":
+            return np.array(Image.open(self._img_paths[frame_idx]).convert("RGB"))
+        else:
+            import cv2 as _cv2
+
+            cap = _cv2.VideoCapture(self.video_path)
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, bgr = cap.read()
+            cap.release()
+            if not ok:
+                return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            return _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+
+
+# ---------------------------------------------------------------------------
+# Person detector (torchvision Faster R-CNN)
+# ---------------------------------------------------------------------------
+class PersonDetector:
+    """Detect persons using torchvision Faster R-CNN (COCO class 1)."""
+
+    def __init__(self, device: str = "cuda", score_threshold: float = 0.5):
+        from torchvision.models.detection import (
+            fasterrcnn_resnet50_fpn_v2,
+            FasterRCNN_ResNet50_FPN_V2_Weights,
+        )
+
+        weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+        self.model = fasterrcnn_resnet50_fpn_v2(weights=weights)
+        self.model.to(device).eval()
+        self.score_threshold = score_threshold
+        self.device = device
+
+    @torch.no_grad()
+    def detect(self, frame_rgb: np.ndarray) -> List[Dict]:
+        """Return list of ``{"bbox_xyxy": [x1,y1,x2,y2], "score": float}``."""
+        img = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+        img = img.unsqueeze(0).to(self.device)
+        out = self.model(img)[0]
+        persons = []
+        for i in range(len(out["labels"])):
+            if out["labels"][i] == 1 and out["scores"][i] > self.score_threshold:
+                box = out["boxes"][i].cpu().numpy().tolist()
+                persons.append({"bbox_xyxy": box, "score": out["scores"][i].item()})
+        return persons
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+def bbox_iou(a: List[float], b: List[float]) -> float:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def mask_to_bbox(mask: np.ndarray) -> Optional[List[int]]:
+    if not mask.any():
+        return None
+    ys, xs = np.where(mask)
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+
+def match_detections_to_tracks(
+    det_bboxes: List[List[float]],
+    tracked: Dict[int, Dict],
+    iou_threshold: float = 0.3,
+) -> Tuple[Dict[int, int], List[int]]:
+    """Match detection bboxes to tracked objects via greedy IoU.
+
+    Returns
+    -------
+    matched : dict mapping det_index -> tracked obj_id
+    unmatched_det_indices : list of detection indices with no match
+    """
+    trk_ids = []
+    trk_bboxes = []
+    for obj_id, info in tracked.items():
+        if info["bbox_xyxy"] is not None:
+            trk_ids.append(obj_id)
+            trk_bboxes.append(info["bbox_xyxy"])
+
+    if not det_bboxes or not trk_bboxes:
+        return {}, list(range(len(det_bboxes)))
+
+    iou_mat = np.zeros((len(det_bboxes), len(trk_bboxes)))
+    for i, db in enumerate(det_bboxes):
+        for j, tb in enumerate(trk_bboxes):
+            iou_mat[i, j] = bbox_iou(db, tb)
+
+    matched: Dict[int, int] = {}
+    used_d, used_t = set(), set()
+    # Greedy: pick highest IoU pair repeatedly
+    for _ in range(min(len(det_bboxes), len(trk_bboxes))):
+        if iou_mat.max() < iou_threshold:
+            break
+        di, ti = np.unravel_index(iou_mat.argmax(), iou_mat.shape)
+        matched[int(di)] = trk_ids[ti]
+        used_d.add(int(di))
+        used_t.add(ti)
+        iou_mat[di, :] = 0
+        iou_mat[:, ti] = 0
+
+    unmatched = [i for i in range(len(det_bboxes)) if i not in used_d]
+    return matched, unmatched
+
+
+# ---------------------------------------------------------------------------
+# Multi-person tracker
+# ---------------------------------------------------------------------------
+class MultiPersonTracker:
+    """Manage multiple SAM 3 tracker states for multi-person tracking."""
+
+    def __init__(self, predictor, lazy_loader, video_h, video_w, num_frames):
+        self.predictor = predictor
+        self.lazy_loader = lazy_loader
+        self.video_h = video_h
+        self.video_w = video_w
+        self.num_frames = num_frames
+        self.tracker_states: List[dict] = []
+        self.next_obj_id = 1
+
+    def _create_state(self) -> dict:
+        """Create a fresh tracker inference state."""
+        state = self.predictor.init_state(
+            video_height=self.video_h,
+            video_width=self.video_w,
+            num_frames=self.num_frames,
+        )
+        state["images"] = self.lazy_loader
+        return state
+
+    def add_persons(
+        self, frame_idx: int, bboxes_xyxy_pixels: List[List[float]]
+    ) -> List[int]:
+        """Seed new persons on *frame_idx*. Returns assigned obj_ids."""
+        if not bboxes_xyxy_pixels:
+            return []
+        state = self._create_state()
+        assigned = []
+        for bbox in bboxes_xyxy_pixels:
+            oid = self.next_obj_id
+            self.next_obj_id += 1
+            x1, y1, x2, y2 = bbox
+            norm = np.array(
+                [[x1 / self.video_w, y1 / self.video_h,
+                  x2 / self.video_w, y2 / self.video_h]],
+                dtype=np.float32,
+            )
+            self.predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=frame_idx,
+                obj_id=oid,
+                box=norm,
+            )
+            assigned.append(oid)
+        self.predictor.propagate_in_video_preflight(state)
+        self.tracker_states.append(state)
+        return assigned
+
+    def propagate_frame(self, frame_idx: int) -> Dict[int, Dict]:
+        """Propagate all states one frame. Returns {obj_id: info_dict}."""
+        results: Dict[int, Dict] = {}
+        for state in self.tracker_states:
+            if not state["obj_ids"]:
+                continue
+            for out in self.predictor.propagate_in_video(
+                state,
+                start_frame_idx=frame_idx,
+                max_frame_num_to_track=0,
+                reverse=False,
+                propagate_preflight=False,
+            ):
+                _, obj_ids, _, video_res_masks, obj_scores = out
+                masks = (video_res_masks > 0.0).squeeze(1).cpu().numpy()
+                scores = obj_scores.sigmoid().squeeze(-1).float().cpu().numpy()
+                for i, oid in enumerate(obj_ids):
+                    m = masks[i].astype(bool)
+                    results[oid] = {
+                        "mask": m,
+                        "bbox_xyxy": mask_to_bbox(m),
+                        "score": float(scores[i]),
+                    }
+        return results
+
+    def propagate_frame_last_state(self, frame_idx: int) -> Dict[int, Dict]:
+        """Propagate only the most recently added state for *frame_idx*."""
+        results: Dict[int, Dict] = {}
+        state = self.tracker_states[-1]
+        if not state["obj_ids"]:
+            return results
+        for out in self.predictor.propagate_in_video(
+            state,
+            start_frame_idx=frame_idx,
+            max_frame_num_to_track=0,
+            reverse=False,
+            propagate_preflight=False,
+        ):
+            _, obj_ids, _, video_res_masks, obj_scores = out
+            masks = (video_res_masks > 0.0).squeeze(1).cpu().numpy()
+            scores = obj_scores.sigmoid().squeeze(-1).float().cpu().numpy()
+            for i, oid in enumerate(obj_ids):
+                m = masks[i].astype(bool)
+                results[oid] = {
+                    "mask": m,
+                    "bbox_xyxy": mask_to_bbox(m),
+                    "score": float(scores[i]),
+                }
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Overlay drawing
+# ---------------------------------------------------------------------------
+def draw_person_overlay(
+    frame_rgb: np.ndarray,
+    persons: Dict[int, Dict],
+    frame_idx: int,
+) -> np.ndarray:
+    """Draw masks, bboxes and 'Person {id}' labels on *frame_rgb*."""
+    import cv2
+
+    overlay = frame_rgb.copy()
+    for obj_id, info in sorted(persons.items()):
+        color_rgb = color_for_id(obj_id)
+        mask = info.get("mask")
+        bbox = info.get("bbox_xyxy")
+
+        # Mask tint
+        if mask is not None and mask.any():
+            if mask.shape != overlay.shape[:2]:
+                mask = cv2.resize(
+                    mask.astype(np.uint8),
+                    (overlay.shape[1], overlay.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            tint = np.array(color_rgb, dtype=np.uint8)
+            overlay[mask] = (0.45 * overlay[mask] + 0.55 * tint).astype(np.uint8)
+
+        # Bbox + label
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color_rgb, 2)
+            label = f"Person {obj_id}"
+            (tw, th), _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+            )
+            cv2.rectangle(
+                overlay,
+                (x1, max(y1 - th - 8, 0)),
+                (x1 + tw + 4, max(y1, th + 8)),
+                color_rgb,
+                -1,
+            )
+            cv2.putText(
+                overlay,
+                label,
+                (x1 + 2, max(y1 - 4, th + 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    # Frame counter
+    cv2.putText(
+        overlay,
+        f"frame {frame_idx}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return overlay
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Detect and track multiple persons in a video with SAM 3.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--video", required=True, help="MP4 or JPEG folder.")
+    p.add_argument(
+        "--detect-every",
+        type=int,
+        default=1,
+        help="Run person detector every N frames. Default: 1 (every frame).",
+    )
+    p.add_argument(
+        "--det-score-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum detection confidence for persons. Default: 0.5.",
+    )
+    p.add_argument(
+        "--iou-threshold",
+        type=float,
+        default=0.3,
+        help="IoU threshold to match a detection to an existing track.",
+    )
+    p.add_argument(
+        "--max-frames", type=int, default=None, help="Limit number of frames."
+    )
+    p.add_argument("--output-json", default=None, help="Save per-frame JSON.")
+    p.add_argument("--output-masks", default=None, help="Save mask PNGs.")
+    p.add_argument("--overlay-video", default=None, help="Save overlay MP4.")
+    p.add_argument("--checkpoint", default=None, help="SAM 3 checkpoint path.")
+    p.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    p.add_argument("--lazy-load", action="store_true", help="O(1) frame memory.")
+    p.add_argument(
+        "--trim-memory",
+        action="store_true",
+        help="Drop old spatial memory (keep obj pointers).",
+    )
+    p.add_argument(
+        "--max-obj-ptrs",
+        type=int,
+        default=16,
+        help="Object pointer attention window.",
+    )
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    args = parse_args()
+
+    # ---- Build models ----
+    print("Building SAM 3 tracker (no detector)...")
+    predictor = build_sam3_tracker_only(
+        checkpoint_path=args.checkpoint,
+        trim_past_memory=args.trim_memory,
+        max_obj_ptrs_in_encoder=args.max_obj_ptrs,
+        device=args.device,
+    )
+
+    print("Loading person detector (Faster R-CNN)...")
+    detector = PersonDetector(
+        device=args.device, score_threshold=args.det_score_threshold
+    )
+
+    # ---- Video setup ----
+    if args.lazy_load:
+        loader = LazyVideoFrameLoader(args.video, image_size=predictor.image_size)
+        video_h, video_w = loader.video_height, loader.video_width
+        num_frames = len(loader)
+    else:
+        loader = None
+        # Fall back to eager loading (handled inside init_state)
+        raise NotImplementedError(
+            "Multi-person tracking requires --lazy-load for frame-by-frame "
+            "propagation. Please add --lazy-load."
+        )
+
+    if args.max_frames is not None:
+        num_frames = min(num_frames, args.max_frames)
+
+    print(f"Video: {video_w}x{video_h}, {num_frames} frames")
+
+    # Original-resolution frame reader (for detection & overlay)
+    orig_reader = OriginalFrameReader(args.video)
+
+    # ---- Tracker ----
+    tracker = MultiPersonTracker(predictor, loader, video_h, video_w, num_frames)
+
+    # ---- Overlay writer ----
+    overlay_writer = None
+    cv2_mod = None
+    if args.overlay_video is not None:
+        import cv2 as cv2_mod
+
+        os.makedirs(
+            os.path.dirname(os.path.abspath(args.overlay_video)), exist_ok=True
+        )
+        fourcc = cv2_mod.VideoWriter_fourcc(*"mp4v")
+        overlay_writer = cv2_mod.VideoWriter(
+            args.overlay_video,
+            fourcc,
+            orig_reader.fps,
+            (orig_reader.width, orig_reader.height),
+        )
+
+    # Mask output dir
+    mask_dir = args.output_masks
+    if mask_dir is not None:
+        os.makedirs(mask_dir, exist_ok=True)
+
+    json_results: Dict[int, List[Dict]] = {}
+
+    # ---- Main loop ----
+    print("Tracking...")
+    try:
+        for frame_idx in tqdm(range(num_frames), desc="frames"):
+            # Step 1: Propagate existing tracks for this frame
+            tracked = tracker.propagate_frame(frame_idx)
+
+            # Step 2: Run person detection (every Nth frame)
+            if frame_idx % args.detect_every == 0:
+                frame_rgb = orig_reader.read_frame(frame_idx)
+                detections = detector.detect(frame_rgb)
+                det_bboxes = [d["bbox_xyxy"] for d in detections]
+
+                # Step 3: Match detections to existing tracks
+                _matched, unmatched_idxs = match_detections_to_tracks(
+                    det_bboxes, tracked, iou_threshold=args.iou_threshold
+                )
+
+                # Step 4: Create new tracks for unmatched detections
+                if unmatched_idxs:
+                    new_bboxes = [det_bboxes[i] for i in unmatched_idxs]
+                    new_ids = tracker.add_persons(frame_idx, new_bboxes)
+                    # Propagate the new state for this frame to get initial masks
+                    new_tracked = tracker.propagate_frame_last_state(frame_idx)
+                    tracked.update(new_tracked)
+                    print(
+                        f"  frame {frame_idx}: detected {len(detections)} persons, "
+                        f"{len(new_ids)} new (ids: {new_ids})"
+                    )
+
+            # Step 5: Collect outputs
+            frame_entries = []
+            for obj_id, info in sorted(tracked.items()):
+                frame_entries.append(
+                    {
+                        "obj_id": obj_id,
+                        "bbox_xyxy_pixels": info["bbox_xyxy"],
+                        "score": info["score"],
+                        "present": info["bbox_xyxy"] is not None,
+                    }
+                )
+            json_results[frame_idx] = frame_entries
+
+            # Stream mask PNGs
+            if mask_dir is not None:
+                for obj_id, info in tracked.items():
+                    m = info["mask"]
+                    png = os.path.join(
+                        mask_dir, f"frame{frame_idx:06d}_person{obj_id}.png"
+                    )
+                    Image.fromarray(m.astype(np.uint8) * 255, mode="L").save(png)
+
+            # Stream overlay frame
+            if overlay_writer is not None:
+                if frame_idx % args.detect_every != 0:
+                    frame_rgb = orig_reader.read_frame(frame_idx)
+                overlay = draw_person_overlay(frame_rgb, tracked, frame_idx)
+                overlay_writer.write(
+                    cv2_mod.cvtColor(overlay, cv2_mod.COLOR_RGB2BGR)
+                )
+
+    finally:
+        if overlay_writer is not None:
+            overlay_writer.release()
+
+    print(f"Tracked {len(json_results)} frames, "
+          f"{tracker.next_obj_id - 1} persons total.")
+
+    # ---- Save JSON ----
+    if args.output_json is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
+        serializable = {
+            "video": os.path.abspath(args.video),
+            "video_height": video_h,
+            "video_width": video_w,
+            "num_frames": num_frames,
+            "total_persons": tracker.next_obj_id - 1,
+            "frames": {
+                str(idx): entries for idx, entries in sorted(json_results.items())
+            },
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(serializable, f, indent=2)
+        print(f"Saved JSON to {args.output_json}")
+
+    if mask_dir is not None:
+        print(f"Saved masks to {mask_dir}")
+    if args.overlay_video is not None:
+        print(f"Saved overlay to {args.overlay_video}")
+
+
+if __name__ == "__main__":
+    main()
