@@ -97,17 +97,19 @@ class LazyVideoFrameLoader:
             first = Image.open(self._img_paths[0])
             self.video_width, self.video_height = first.size
             self._num_frames = len(self._img_paths)
+            self._vr = None
         else:
             self._mode = "mp4"
             import decord
 
             decord.bridge.set_bridge("torch")
             self._video_path = video_path
-            vr = decord.VideoReader(video_path)
-            first_frame = vr[0]
+            self._vr = decord.VideoReader(
+                video_path, width=image_size, height=image_size
+            )
+            first_frame = decord.VideoReader(video_path)[0]
             self.video_height, self.video_width = first_frame.shape[:2]
-            self._num_frames = len(vr)
-            del vr
+            self._num_frames = len(self._vr)
 
     def __len__(self):
         return self._num_frames
@@ -120,14 +122,7 @@ class LazyVideoFrameLoader:
                 torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float() / 255.0
             )
         else:
-            import decord
-
-            decord.bridge.set_bridge("torch")
-            vr = decord.VideoReader(
-                self._video_path, width=self.image_size, height=self.image_size
-            )
-            img = vr[index].permute(2, 0, 1).float() / 255.0
-            del vr
+            img = self._vr[index].permute(2, 0, 1).float() / 255.0
         img = (img - self._img_mean) / self._img_std
         return img
 
@@ -136,10 +131,12 @@ class LazyVideoFrameLoader:
 # Lazy original-resolution frame reader (for overlay & detection)
 # ---------------------------------------------------------------------------
 class OriginalFrameReader:
-    """Read original-resolution RGB frames one at a time."""
+    """Read original-resolution RGB frames sequentially (keeps file handle open)."""
 
     def __init__(self, video_path: str):
         self.video_path = video_path
+        self._cap = None
+        self._next_idx = 0
         if os.path.isdir(video_path):
             self._mode = "jpeg"
             jpg_exts = (".jpg", ".jpeg", ".JPG", ".JPEG")
@@ -153,12 +150,11 @@ class OriginalFrameReader:
         else:
             import cv2 as _cv2
 
-            cap = _cv2.VideoCapture(video_path)
-            self.width = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
-            self.num_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
+            self._cap = _cv2.VideoCapture(video_path)
+            self.width = int(self._cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self._cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = self._cap.get(_cv2.CAP_PROP_FPS) or 30.0
+            self.num_frames = int(self._cap.get(_cv2.CAP_PROP_FRAME_COUNT))
             self._mode = "mp4"
 
     def read_frame(self, frame_idx: int) -> np.ndarray:
@@ -168,13 +164,18 @@ class OriginalFrameReader:
         else:
             import cv2 as _cv2
 
-            cap = _cv2.VideoCapture(self.video_path)
-            cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, bgr = cap.read()
-            cap.release()
+            # Sequential reads are fast; only seek if out of order
+            if frame_idx != self._next_idx:
+                self._cap.set(_cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, bgr = self._cap.read()
+            self._next_idx = frame_idx + 1
             if not ok:
                 return np.zeros((self.height, self.width, 3), dtype=np.uint8)
             return _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+
+    def close(self):
+        if self._cap is not None:
+            self._cap.release()
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +341,7 @@ class MultiPersonTracker:
                 max_frame_num_to_track=0,
                 reverse=False,
                 propagate_preflight=False,
+                tqdm_disable=True,
             ):
                 _, obj_ids, _, video_res_masks, obj_scores = out
                 masks = (video_res_masks > 0.0).squeeze(1).cpu().numpy()
@@ -631,6 +633,7 @@ def main():
     finally:
         if overlay_writer is not None:
             overlay_writer.release()
+        orig_reader.close()
 
     print(f"Tracked {len(json_results)} frames, "
           f"{tracker.next_obj_id - 1} persons total.")

@@ -63,20 +63,21 @@ class LazyVideoFrameLoader:
                 raise RuntimeError(f"No JPEG frames in {video_path}")
             names.sort(key=lambda p: int(os.path.splitext(p)[0]))
             self._img_paths = [os.path.join(video_path, n) for n in names]
-            # Read first frame for dimensions
             first = Image.open(self._img_paths[0])
             self.video_width, self.video_height = first.size
             self._num_frames = len(self._img_paths)
+            self._vr = None
         else:
             self._mode = "mp4"
             import decord
             decord.bridge.set_bridge("torch")
             self._video_path = video_path
-            vr = decord.VideoReader(video_path)
-            first_frame = vr[0]
+            self._vr = decord.VideoReader(
+                video_path, width=image_size, height=image_size
+            )
+            first_frame = decord.VideoReader(video_path)[0]
             self.video_height, self.video_width = first_frame.shape[:2]
-            self._num_frames = len(vr)
-            del vr
+            self._num_frames = len(self._vr)
 
     def __len__(self):
         return self._num_frames
@@ -87,13 +88,7 @@ class LazyVideoFrameLoader:
             img_pil = img_pil.resize((self.image_size, self.image_size))
             img = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float() / 255.0
         else:
-            import decord
-            decord.bridge.set_bridge("torch")
-            vr = decord.VideoReader(
-                self._video_path, width=self.image_size, height=self.image_size
-            )
-            img = vr[index].permute(2, 0, 1).float() / 255.0
-            del vr
+            img = self._vr[index].permute(2, 0, 1).float() / 255.0
         img = (img - self._img_mean) / self._img_std
         return img
 
