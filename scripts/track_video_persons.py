@@ -382,11 +382,21 @@ class MultiPersonTracker:
                     del d[t]
 
     def propagate_frame(self, frame_idx: int) -> Dict[int, Dict]:
-        """Propagate all states one frame. Returns {obj_id: info_dict}."""
+        """Propagate all states one frame. Returns {obj_id: info_dict}.
+
+        The ViT backbone is shared: the first state computes and caches the
+        features, and all subsequent states reuse the cache — so the backbone
+        runs only **once** per frame regardless of how many states exist.
+        """
         results: Dict[int, Dict] = {}
+        shared_cache = None
         for state in self.tracker_states:
             if not state["obj_ids"]:
                 continue
+            # Inject cached backbone features from the first state that
+            # computed them, so later states skip the backbone entirely.
+            if shared_cache is not None:
+                state["cached_features"] = shared_cache
             for out in self.predictor.propagate_in_video(
                 state,
                 start_frame_idx=frame_idx,
@@ -405,6 +415,9 @@ class MultiPersonTracker:
                         "bbox_xyxy": mask_to_bbox(m),
                         "score": float(scores[i]),
                     }
+            # Grab the cache after the first state computes backbone features
+            if shared_cache is None:
+                shared_cache = state["cached_features"]
         self._evict_old_outputs(frame_idx)
         return results
 
