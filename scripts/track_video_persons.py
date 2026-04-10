@@ -349,7 +349,13 @@ class MultiPersonTracker:
         Outside both → delete the entire entry.
         Always drop: pred_masks, object_score_logits, iou_score.
         """
-        mem_cutoff = frame_idx - self.predictor.num_maskmem - 1
+        # The tracker reads maskmem_features from entries it finds in
+        # output_dict.  If an entry exists but maskmem_features was stripped,
+        # it crashes with a KeyError.  So we can only drop maskmem_features
+        # by deleting the ENTIRE entry from output_dict.  We keep obj_ptr
+        # in a separate lightweight store instead.
+        r = self.predictor.memory_temporal_stride_for_eval
+        mem_cutoff = frame_idx - (self.predictor.num_maskmem) * r - 1
         ptr_cutoff = frame_idx - self.predictor.max_obj_ptrs_in_encoder - 1
 
         for state in self.tracker_states:
@@ -363,24 +369,16 @@ class MultiPersonTracker:
                     for t, out in d.items():
                         if t >= frame_idx:
                             continue
-                        # Always strip these (never read in forward-only)
+                        # Always strip fields never read in forward-only
                         for drop in (
                             "pred_masks", "object_score_logits",
                             "iou_score", "eff_iou_score",
                         ):
                             out.pop(drop, None)
-                        # Drop spatial memory outside its window
+                        # Outside spatial window: delete entire entry
+                        # (tracker crashes if entry exists without
+                        #  maskmem_features, so we must remove it fully)
                         if t < mem_cutoff:
-                            out.pop("maskmem_features", None)
-                            out.pop("maskmem_pos_enc", None)
-                        # Drop obj_ptr outside its window
-                        if t < ptr_cutoff:
-                            out.pop("obj_ptr", None)
-                        # If nothing useful left, mark for full deletion
-                        if not any(
-                            k in out
-                            for k in ("maskmem_features", "obj_ptr")
-                        ):
                             to_del.append(t)
                     for t in to_del:
                         del d[t]

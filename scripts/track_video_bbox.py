@@ -566,12 +566,13 @@ def main() -> None:
             # Only keep lightweight metadata — no masks in memory
             json_results[int(frame_idx)] = frame_entries
 
-            # Two independent eviction windows:
-            #   spatial memory (maskmem_features): last num_maskmem frames
-            #   object pointers (obj_ptr):         last max_obj_ptrs frames
-            # Everything else is dropped immediately.
-            mem_cutoff = frame_idx - predictor.num_maskmem - 1
-            ptr_cutoff = frame_idx - predictor.max_obj_ptrs_in_encoder - 1
+            # Evict old entries.  The tracker crashes if an entry exists in
+            # output_dict but maskmem_features was stripped (KeyError), so we
+            # must delete the entire entry once it leaves the spatial window.
+            # obj_ptr lives inside these entries too, but it's tiny (~1 KB)
+            # and gets deleted along with the entry.
+            r = getattr(predictor, "memory_temporal_stride_for_eval", 1)
+            mem_cutoff = frame_idx - predictor.num_maskmem * r - 1
             for state_dict in [inference_state["output_dict"]] + list(
                 inference_state["output_dict_per_obj"].values()
             ):
@@ -587,13 +588,6 @@ def main() -> None:
                         ):
                             out.pop(drop, None)
                         if t < mem_cutoff:
-                            out.pop("maskmem_features", None)
-                            out.pop("maskmem_pos_enc", None)
-                        if t < ptr_cutoff:
-                            out.pop("obj_ptr", None)
-                        if not any(
-                            k in out for k in ("maskmem_features", "obj_ptr")
-                        ):
                             to_del.append(t)
                     for t in to_del:
                         del d[t]
