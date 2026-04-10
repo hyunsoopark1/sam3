@@ -39,7 +39,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from sam3.model_builder import build_sam3_image_model, build_sam3_tracker_only
+from sam3.model_builder import build_sam3_detector_and_tracker
 
 # ---------------------------------------------------------------------------
 # Colors for up to 20 persons (RGB).  Wraps around for more.
@@ -179,40 +179,20 @@ class OriginalFrameReader:
 
 
 # ---------------------------------------------------------------------------
-# Person detector (SAM3 DETR with text prompt)
+# Person detector (SAM3 DETR with text prompt — uses shared processor)
 # ---------------------------------------------------------------------------
 class PersonDetector:
-    """Detect persons using the SAM3 DETR detector with text prompt 'person'.
+    """Thin wrapper around a :class:`Sam3Processor` that runs the text prompt
+    ``"person"`` and returns per-detection dicts with bbox, mask, and score.
 
-    This shares the same ViT backbone architecture as the tracker (though the
-    weights are loaded into a separate module instance).  The SAM3 detector
-    produces both bounding boxes *and* segmentation masks, which are used
-    directly to initialise tracker states — giving better masks than a
-    bbox-only detector.
+    The processor (and its underlying backbone) is created externally by
+    :func:`build_sam3_detector_and_tracker` so that the ViT backbone is
+    physically shared with the tracker — no duplicate weights in memory.
     """
 
-    def __init__(
-        self,
-        device: str = "cuda",
-        score_threshold: float = 0.5,
-        checkpoint_path: Optional[str] = None,
-        prompt: str = "person",
-    ):
-        from sam3.model.sam3_image_processor import Sam3Processor
-
-        image_model = build_sam3_image_model(
-            device=device,
-            checkpoint_path=checkpoint_path,
-            enable_segmentation=True,
-            enable_inst_interactivity=False,
-        )
-        self.processor = Sam3Processor(
-            image_model,
-            device=device,
-            confidence_threshold=score_threshold,
-        )
+    def __init__(self, processor, prompt: str = "person"):
+        self.processor = processor
         self.prompt = prompt
-        self.device = device
 
     @torch.inference_mode()
     def detect(self, frame_rgb: np.ndarray) -> List[Dict]:
@@ -624,21 +604,16 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ---- Build models ----
-    print("Building SAM 3 tracker...")
-    predictor = build_sam3_tracker_only(
+    # ---- Build models (shared backbone) ----
+    print("Building SAM 3 detector + tracker (shared ViT backbone)...")
+    processor, predictor = build_sam3_detector_and_tracker(
         checkpoint_path=args.checkpoint,
         trim_past_memory=args.trim_memory,
         max_obj_ptrs_in_encoder=args.max_obj_ptrs,
+        det_confidence=args.det_score_threshold,
         device=args.device,
     )
-
-    print("Building SAM 3 person detector (DETR with 'person' prompt)...")
-    detector = PersonDetector(
-        device=args.device,
-        score_threshold=args.det_score_threshold,
-        checkpoint_path=args.checkpoint,
-    )
+    detector = PersonDetector(processor)
 
     # ---- Video setup ----
     if args.lazy_load:

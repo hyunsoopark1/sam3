@@ -598,6 +598,78 @@ def build_sam3_tracker_only(
     return tracker
 
 
+def build_sam3_detector_and_tracker(
+    checkpoint_path: Optional[str] = None,
+    load_from_HF: bool = True,
+    trim_past_memory: bool = False,
+    max_obj_ptrs_in_encoder: int = 16,
+    det_confidence: float = 0.5,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+):
+    """Build SAM3 DETR detector + tracker with a **single shared backbone**.
+
+    Memory is the same as the full SAM3 model (~848M params) instead of
+    ~1180M when building detector and tracker separately (which would
+    duplicate the ViT backbone).
+
+    Returns ``(processor, tracker)`` where *processor* is a
+    :class:`Sam3Processor` for text-prompted detection and *tracker* is a
+    :class:`Sam3TrackerPredictor` for mask propagation.
+    """
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    if load_from_HF and checkpoint_path is None:
+        checkpoint_path = download_ckpt_from_hf(version="sam3")
+
+    # 1) Build the image model (detector) — includes ViT + SAM2 neck
+    image_model = build_sam3_image_model(
+        device=device,
+        checkpoint_path=checkpoint_path,
+        load_from_HF=False,  # we already resolved the path
+        enable_segmentation=True,
+        enable_inst_interactivity=True,  # needed for SAM2 neck in backbone
+    )
+
+    # 2) Build tracker WITHOUT backbone (lightweight: ~130M params)
+    tracker = build_tracker(
+        apply_temporal_disambiguation=False,
+        with_backbone=False,
+        trim_past_non_cond_mem=trim_past_memory,
+        max_obj_ptrs_in_encoder=max_obj_ptrs_in_encoder,
+    )
+
+    # 3) Load tracker weights from the same checkpoint
+    if checkpoint_path is not None:
+        with g_pathmgr.open(checkpoint_path, "rb") as f:
+            ckpt = torch.load(f, map_location="cpu", weights_only=True)
+        if "model" in ckpt and isinstance(ckpt["model"], dict):
+            ckpt = ckpt["model"]
+        tracker_prefix = "tracker."
+        tracker_ckpt = {
+            k[len(tracker_prefix):]: v
+            for k, v in ckpt.items()
+            if k.startswith(tracker_prefix)
+        }
+        missing, unexpected = tracker.load_state_dict(tracker_ckpt, strict=False)
+        if missing:
+            print(f"[detector_and_tracker] tracker missing keys: {missing}")
+        if unexpected:
+            print(f"[detector_and_tracker] tracker unexpected keys: {unexpected}")
+
+    # 4) Share the backbone — single ViT in memory
+    tracker.backbone = image_model.backbone
+    tracker.to(device=device)
+    tracker.eval()
+
+    # 5) Free the redundant internal tracker inside image_model
+    image_model.inst_interactive_predictor = None
+
+    processor = Sam3Processor(
+        image_model, device=device, confidence_threshold=det_confidence
+    )
+    return processor, tracker
+
+
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     """Create SAM3 text encoder."""
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
