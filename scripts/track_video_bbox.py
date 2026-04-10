@@ -566,20 +566,32 @@ def main() -> None:
             # Only keep lightweight metadata — no masks in memory
             json_results[int(frame_idx)] = frame_entries
 
-            # Evict old frame outputs outside the attention window
-            cutoff = frame_idx - evict_horizon
-            if cutoff >= 0:
+            # Strip unneeded fields and evict old entries outside the
+            # attention window.  Keep only maskmem_features (spatial memory,
+            # last num_maskmem frames), maskmem_pos_enc, and obj_ptr (last
+            # max_obj_ptrs_in_encoder frames).
+            mem_cutoff = frame_idx - predictor.num_maskmem - 1
+            ptr_cutoff = frame_idx - predictor.max_obj_ptrs_in_encoder - 1
+            full_cutoff = min(mem_cutoff, ptr_cutoff)
+            for state_dict in [inference_state["output_dict"]] + list(
+                inference_state["output_dict_per_obj"].values()
+            ):
                 for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                    d = inference_state["output_dict"][key]
-                    to_del = [t for t in d if t < cutoff]
+                    d = state_dict[key]
+                    to_del = []
+                    for t, out in d.items():
+                        if t >= frame_idx:
+                            continue
+                        if t < full_cutoff:
+                            to_del.append(t)
+                        else:
+                            for drop_key in (
+                                "pred_masks", "object_score_logits",
+                                "iou_score", "eff_iou_score",
+                            ):
+                                out.pop(drop_key, None)
                     for t in to_del:
                         del d[t]
-                for obj_dict in inference_state["output_dict_per_obj"].values():
-                    for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                        d = obj_dict[key]
-                        to_del = [t for t in d if t < cutoff]
-                        for t in to_del:
-                            del d[t]
 
     finally:
         if overlay_writer is not None:
