@@ -471,6 +471,12 @@ def main() -> None:
             args.overlay_video, fourcc, overlay_fps, (overlay_w, overlay_h)
         )
 
+    # How far back the tracker actually looks — anything older can be evicted.
+    evict_horizon = max(
+        predictor.num_maskmem,
+        predictor.max_obj_ptrs_in_encoder,
+    ) + 2
+
     print("Propagating mask through the video...")
     try:
         for (
@@ -559,6 +565,21 @@ def main() -> None:
 
             # Only keep lightweight metadata — no masks in memory
             json_results[int(frame_idx)] = frame_entries
+
+            # Evict old frame outputs outside the attention window
+            cutoff = frame_idx - evict_horizon
+            if cutoff >= 0:
+                for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                    d = inference_state["output_dict"][key]
+                    to_del = [t for t in d if t < cutoff]
+                    for t in to_del:
+                        del d[t]
+                for obj_dict in inference_state["output_dict_per_obj"].values():
+                    for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                        d = obj_dict[key]
+                        to_del = [t for t in d if t < cutoff]
+                        for t in to_del:
+                            del d[t]
 
     finally:
         if overlay_writer is not None:

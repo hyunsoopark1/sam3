@@ -290,6 +290,12 @@ class MultiPersonTracker:
         self.num_frames = num_frames
         self.tracker_states: List[dict] = []
         self.next_obj_id = 1
+        # How far back the tracker actually looks for memory / pointers.
+        # Anything older is dead weight and can be deleted.
+        self._evict_horizon = max(
+            predictor.num_maskmem,           # spatial memory window (default 7)
+            predictor.max_obj_ptrs_in_encoder,  # pointer window (default 16)
+        ) + 2  # small margin
 
     def _create_state(self) -> dict:
         """Create a fresh tracker inference state."""
@@ -329,6 +335,31 @@ class MultiPersonTracker:
         self.tracker_states.append(state)
         return assigned
 
+    def _evict_old_outputs(self, frame_idx: int):
+        """Delete output_dict entries older than the attention window.
+
+        The tracker only looks back ``num_maskmem`` frames for spatial memory
+        and ``max_obj_ptrs_in_encoder`` frames for object pointers.  Everything
+        older is never accessed in forward-only tracking, so we delete it to
+        keep GPU/CPU memory flat.
+        """
+        cutoff = frame_idx - self._evict_horizon
+        if cutoff < 0:
+            return
+        for state in self.tracker_states:
+            for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                d = state["output_dict"][key]
+                to_del = [t for t in d if t < cutoff]
+                for t in to_del:
+                    del d[t]
+            # Also evict per-object slices
+            for obj_dict in state["output_dict_per_obj"].values():
+                for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                    d = obj_dict[key]
+                    to_del = [t for t in d if t < cutoff]
+                    for t in to_del:
+                        del d[t]
+
     def propagate_frame(self, frame_idx: int) -> Dict[int, Dict]:
         """Propagate all states one frame. Returns {obj_id: info_dict}."""
         results: Dict[int, Dict] = {}
@@ -353,6 +384,7 @@ class MultiPersonTracker:
                         "bbox_xyxy": mask_to_bbox(m),
                         "score": float(scores[i]),
                     }
+        self._evict_old_outputs(frame_idx)
         return results
 
     def propagate_frame_last_state(self, frame_idx: int) -> Dict[int, Dict]:
