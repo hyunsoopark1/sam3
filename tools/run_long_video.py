@@ -381,25 +381,21 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 
 def _trim_tracker_output_dict(tracker_state, current_frame_idx,
                               num_maskmem=7):
-    """Remove heavy tensors from the tracker's output_dict, and offload
-    old spatial memory to CPU.
+    """Remove heavy tensors from the tracker's output_dict, and free
+    old spatial memory entirely (set to None).
 
-    - ``maskmem_features`` is NEVER deleted (the tracker's frame_filter with
-      use_memory_selection can pick any past frame for spatial attention).
-      Instead, old frames' maskmem_features are moved to CPU to save GPU
-      memory.  The tracker loads them back with ``.cuda(non_blocking=True)``.
-    - ``maskmem_pos_enc`` is the same constant across frames, so kept.
-    - ``obj_ptr`` + ``eff_iou_score`` are kept on GPU (small, needed for
-      pointer cross-attention and memory selection).
-    - Everything else (pred_masks, pred_masks_high_res, object_score_logits,
-      iou_score, etc.) is deleted from all frames.
+    - Recent frames (last ``num_maskmem``): keep ``maskmem_features`` on GPU.
+    - Older frames: set ``maskmem_features`` and ``maskmem_pos_enc`` to
+      ``None`` to free memory.  The patched
+      ``_prepare_memory_conditioned_features`` will skip these frames.
+    - ``obj_ptr`` + ``eff_iou_score`` are kept on ALL frames for re-id.
+    - Everything else (pred_masks, object_score_logits, etc.) is deleted.
 
     Also trims ``output_dict_per_obj``.
     """
     keys_to_keep = {
         "maskmem_features", "maskmem_pos_enc", "obj_ptr", "eff_iou_score",
     }
-    # Frames older than this get maskmem_features offloaded to CPU
     offload_cutoff = current_frame_idx - num_maskmem
 
     def _trim_bucket(bucket):
@@ -409,18 +405,12 @@ def _trim_tracker_output_dict(tracker_state, current_frame_idx,
             # Delete unwanted keys
             for k in [k for k in frame_out if k not in keys_to_keep]:
                 del frame_out[k]
-            # Offload old spatial memory to CPU (saves GPU, tracker will
-            # .cuda() it back when needed)
+            # Free old spatial memory (set to None, don't delete the key)
             if fidx < offload_cutoff:
-                feats = frame_out.get("maskmem_features")
-                if feats is not None and feats.is_cuda:
-                    frame_out["maskmem_features"] = feats.cpu()
-                pos_enc = frame_out.get("maskmem_pos_enc")
-                if pos_enc is not None and isinstance(pos_enc, list):
-                    frame_out["maskmem_pos_enc"] = [
-                        x.cpu() if isinstance(x, torch.Tensor) and x.is_cuda else x
-                        for x in pos_enc
-                    ]
+                if frame_out.get("maskmem_features") is not None:
+                    frame_out["maskmem_features"] = None
+                if frame_out.get("maskmem_pos_enc") is not None:
+                    frame_out["maskmem_pos_enc"] = None
 
     # --- main output_dict ---
     output_dict = tracker_state.get("output_dict")
@@ -727,30 +717,70 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
 
 
 # ---------------------------------------------------------------------------
-# NOTE: Option B (per-object attention masking) was investigated but is not
-# feasible -- the tracker's RoPEAttention-based decoder layers assert
-# `memory_key_padding_mask is None` (decoder.py:939).  Supporting it would
-# require modifying SAM3's core model code.
+# Patch _prepare_memory_conditioned_features to skip frames where
+# maskmem_features has been set to None by our trimming.
 #
-# The current approach (Option A) uses no_obj_embed_spatial as a placeholder
-# for objects that didn't exist at past frames.  This is what SAM3 was
-# trained with and works correctly without any model changes.
+# The original code at line 656 does:
+#     feats = prev["maskmem_features"].cuda(non_blocking=True)
+# which crashes if maskmem_features is None.  Our patch wraps the original
+# to filter out such frames before they reach the spatial memory loop.
 # ---------------------------------------------------------------------------
 
-def _install_obj_attention_mask(model):  # pragma: no cover
-    """Not usable -- kept only as documentation of the approach."""
-    """Monkey-patch the tracker's _prepare_memory_conditioned_features to build
-    a per-object attention mask based on ``_obj_first_appeared_frame``.
-
-    After patching, the tracker will:
-    1. Check each object's first-appeared frame from the consolidated state
-    2. For spatial memory frames before an object appeared, set that object's
-       mask to True (excluded from attention)
-    3. Same for obj_ptr tokens from frames before the object appeared
-    4. Pass the real mask to the encoder instead of None
-    """
+def _install_memory_guard(model):
+    """Patch the tracker to skip frames with maskmem_features=None."""
     import types
 
+    tracker = model.tracker
+    _orig_fn = tracker._prepare_memory_conditioned_features
+
+    @torch.inference_mode()
+    def _guarded_prepare_memory(self, frame_idx, is_init_cond_frame,
+                                current_vision_feats, current_vision_pos_embeds,
+                                feat_sizes, output_dict, num_frames,
+                                track_in_reverse=False, use_prev_mem_frame=True):
+        # Temporarily remove frames with maskmem_features=None from
+        # output_dict so the original function's `dict.get()` returns None
+        # for them (causing them to be skipped at line 652).
+        removed = {}
+        for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            bucket = output_dict.get(bucket_name, {})
+            for fidx in list(bucket.keys()):
+                out = bucket[fidx]
+                if out is not None and out.get("maskmem_features") is None:
+                    removed[(bucket_name, fidx)] = bucket.pop(fidx)
+
+        try:
+            result = _orig_fn(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                output_dict=output_dict,
+                num_frames=num_frames,
+                track_in_reverse=track_in_reverse,
+                use_prev_mem_frame=use_prev_mem_frame,
+            )
+        finally:
+            # Restore removed frames (they still have obj_ptr etc.)
+            for (bucket_name, fidx), out in removed.items():
+                output_dict[bucket_name][fidx] = out
+
+        return result
+
+    tracker._prepare_memory_conditioned_features = types.MethodType(
+        _guarded_prepare_memory, tracker
+    )
+
+def _install_obj_attention_mask(model):  # pragma: no cover -- not usable
+    """NOT USABLE: tracker's RoPEAttention decoder asserts mask is None.
+    Kept as documentation only."""
+    raise NotImplementedError(
+        "Option B (per-object attention masking) is blocked by "
+        "assert memory_key_padding_mask is None in decoder.py:939"
+    )
+    # Dead code below kept for reference
+    import types
     tracker = model.tracker
     _orig_fn = tracker._prepare_memory_conditioned_features
 
@@ -1009,6 +1039,9 @@ def run_long_video(
         f"obj_ptr window: {prev_ptrs} -> {max_obj_ptrs} frames "
         f"(~{max_obj_ptrs / 30:.1f}s at 30 fps)"
     )
+
+    # ---- 1c. Patch tracker to handle trimmed spatial memory ----------------
+    _install_memory_guard(model)
 
     # ---- 2. Build lazy frame loader ----------------------------------------
     image_size = model.image_size
