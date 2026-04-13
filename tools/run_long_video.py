@@ -10,9 +10,11 @@ Key optimizations:
      consumed by the model.  ``init_state`` is bypassed entirely so that
      ``load_resource_as_video_frames`` is never called.
   2. After every frame the tracker's per-frame output_dict is trimmed so that
-     only ``maskmem_features`` (spatial memory) and ``obj_ptr`` (object
-     pointer) survive.  Everything else -- pred_masks, pred_masks_high_res,
-     maskmem_pos_enc, object_score_logits, etc. -- is deleted immediately.
+     only the three keys the tracker reads from past frames survive:
+     ``maskmem_features`` (spatial memory), ``maskmem_pos_enc`` (its
+     positional encoding), and ``obj_ptr`` (object pointer).  Everything
+     else -- pred_masks, pred_masks_high_res, object_score_logits, etc. --
+     is deleted immediately.
   3. cached_frame_outputs is cleared after each frame.
 
 Usage:
@@ -378,14 +380,18 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 # ---------------------------------------------------------------------------
 
 def _trim_tracker_output_dict(tracker_state):
-    """Remove all heavy tensors from the tracker's output_dict except
-    ``maskmem_features`` (spatial) and ``obj_ptr``.
+    """Remove all heavy tensors from the tracker's output_dict except the
+    three keys the tracker reads from past frames during propagation:
+
+    - ``maskmem_features``  -- spatial memory fed into memory attention
+    - ``maskmem_pos_enc``   -- positional encoding for the spatial memory
+    - ``obj_ptr``           -- object pointer token for cross-attention
     """
     output_dict = tracker_state.get("output_dict")
     if output_dict is None:
         return
 
-    keys_to_keep = {"maskmem_features", "obj_ptr"}
+    keys_to_keep = {"maskmem_features", "maskmem_pos_enc", "obj_ptr"}
 
     for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
         bucket = output_dict.get(bucket_name, {})
