@@ -421,6 +421,98 @@ def _trim_tracker_output_dict(tracker_state):
 
 
 # ---------------------------------------------------------------------------
+# Consolidate multiple tracker states into a single state.
+#
+# When objects are detected on different frames, SAM3 creates separate
+# tracker states.  Each state runs a full propagation per frame, so
+# N states = N× tracker cost.  Consolidation merges all objects into one
+# state so the tracker runs only once (batched) per frame.
+# ---------------------------------------------------------------------------
+
+def _consolidate_tracker_states(model, inference_state, frame_idx):
+    """Merge all tracker states into a single state.
+
+    Collects the most recent mask for every tracked object from the cached
+    frame outputs, creates a fresh tracker state, and adds all objects to it.
+    The old states are discarded.
+
+    This is called when ``len(tracker_states_local) > 1`` and turns N
+    sequential tracker propagations into 1 batched propagation.
+    """
+    import torch.nn.functional as F
+
+    tracker_states = inference_state["tracker_inference_states"]
+    if len(tracker_states) <= 1:
+        return  # nothing to consolidate
+
+    # --- collect all obj_ids across all states ---
+    all_obj_ids = []
+    for state in tracker_states:
+        all_obj_ids.extend(state.get("obj_ids", []))
+    if len(all_obj_ids) == 0:
+        return
+
+    # --- get current masks from cached_frame_outputs ---
+    # cached_frame_outputs[frame_idx] = {obj_id: mask_tensor}
+    # These are the full-resolution binary masks the model just produced.
+    cached = inference_state["cached_frame_outputs"].get(frame_idx, {})
+    if len(cached) == 0:
+        return  # no outputs to consolidate from
+
+    orig_h = inference_state["orig_height"]
+    orig_w = inference_state["orig_width"]
+    feature_cache = inference_state["feature_cache"]
+    num_frames = inference_state["num_frames"]
+
+    # --- create a single fresh tracker state ---
+    new_state = model.tracker.init_state(
+        cached_features=feature_cache,
+        video_height=orig_h,
+        video_width=orig_w,
+        num_frames=num_frames,
+    )
+    # share backbone output from the previous state
+    new_state["backbone_out"] = tracker_states[0].get("backbone_out", None)
+
+    input_mask_res = model.tracker.input_mask_size
+
+    # --- add every tracked object with its current mask ---
+    for obj_id in all_obj_ids:
+        mask_tensor = cached.get(obj_id)
+        if mask_tensor is None:
+            continue
+        # cached masks are (1, H_video, W_video) bool -- resize to input_mask_size
+        mask_float = mask_tensor.float()
+        if mask_float.dim() == 3:
+            mask_float = mask_float.squeeze(0)  # (H, W)
+        mask_resized = F.interpolate(
+            mask_float[None, None],
+            size=(input_mask_res, input_mask_res),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0) > 0
+        model.tracker.add_new_mask(
+            inference_state=new_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask_resized,
+            add_mask_to_memory=True,
+        )
+
+    model.tracker.propagate_in_video_preflight(new_state, run_mem_encoder=True)
+
+    # --- replace all old states with the single consolidated state ---
+    n_old = len(tracker_states)
+    n_objs = len(new_state.get("obj_ids", []))
+    tracker_states.clear()
+    tracker_states.append(new_state)
+    print(
+        f"    [consolidate] frame {frame_idx}: "
+        f"merged {n_old} states into 1 ({n_objs} objects)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main: memory-efficient propagation -> visualization video
 # ---------------------------------------------------------------------------
 
@@ -557,8 +649,12 @@ def run_long_video(
         writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         t_vis_total += time.time() - t_vis_start
 
-        # -- trim tracker memory to keep only spatial + obj_ptr --------------
+        # -- consolidate tracker states if >1 (before trimming clears masks) --
         t_trim_start = time.time()
+        if len(inference_state["tracker_inference_states"]) > 1:
+            _consolidate_tracker_states(model, inference_state, frame_idx)
+
+        # -- trim tracker memory to keep only spatial + obj_ptr --------------
         for tracker_state in inference_state["tracker_inference_states"]:
             _trim_tracker_output_dict(tracker_state)
 
