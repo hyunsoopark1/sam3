@@ -811,113 +811,6 @@ def _install_obj_attention_mask(model):
         real_encoder = self.transformer.encoder
         spatial_frames_info = []  # will be filled by the interceptor
 
-        class _EncoderWithMask:
-            """Wrapper that intercepts the encoder call to inject a real
-            prompt_key_padding_mask based on per-object first-appeared frame."""
-
-            def __init__(self, real_enc, first_frames, batch_size, device):
-                self.real_enc = real_enc
-                self.first_frames = first_frames  # list[int], len=B
-                self.B = batch_size
-                self.device = device
-                # Forward any attribute access to the real encoder
-                for attr in dir(real_enc):
-                    if not attr.startswith("_") and not hasattr(self, attr):
-                        try:
-                            setattr(self, attr, getattr(real_enc, attr))
-                        except Exception:
-                            pass
-
-            def __call__(self, *args, **kwargs):
-                # Build the per-object mask from spatial_frames_info
-                # spatial_frames_info is populated by the patched
-                # _prepare_memory_conditioned_features above via the
-                # to_cat_prompt_mask list.  But we actually need the frame
-                # indices for each spatial chunk.
-                #
-                # The prompt has structure:
-                #   [spatial_chunk_0, spatial_chunk_1, ..., obj_ptr_chunk]
-                # We need to know which frame each spatial chunk came from.
-                #
-                # Since we can't easily extract this from the original fn,
-                # we take a different approach: read the frame info that
-                # was stashed on the tracker by the consolidation code.
-                spatial_info = getattr(self.real_enc, "_spatial_frames_info", None)
-                if spatial_info is not None and len(spatial_info) > 0:
-                    prompt = kwargs.get("prompt", args[5] if len(args) > 5 else None)
-                    if prompt is not None:
-                        total_len = prompt.shape[0]
-                        # Build mask: (B, total_len), True = exclude
-                        mask = torch.zeros(self.B, total_len, device=self.device, dtype=torch.bool)
-                        offset = 0
-                        for (mem_frame_idx, seq_len) in spatial_info:
-                            for obj_batch_idx, first_f in enumerate(self.first_frames):
-                                if mem_frame_idx < first_f:
-                                    mask[obj_batch_idx, offset:offset + seq_len] = True
-                            offset += seq_len
-                        # Also mask obj_ptr tokens (they come after spatial tokens)
-                        ptr_info = getattr(self.real_enc, "_ptr_frames_info", None)
-                        if ptr_info is not None:
-                            for (ptr_frame_idx, ptr_len) in ptr_info:
-                                for obj_batch_idx, first_f in enumerate(self.first_frames):
-                                    if ptr_frame_idx < first_f:
-                                        mask[obj_batch_idx, offset:offset + ptr_len] = True
-                                offset += ptr_len
-                        # Only use mask if any entries are True
-                        if mask.any():
-                            kwargs["prompt_key_padding_mask"] = mask
-                # Clean up
-                self.real_enc._spatial_frames_info = None
-                self.real_enc._ptr_frames_info = None
-                return self.real_enc(*args, **kwargs)
-
-        # Now we need to stash frame info during the original fn's execution.
-        # We do this by patching to_cat_prompt_mask collection.
-        # But that's deep inside _prepare_memory_conditioned_features...
-        #
-        # Cleaner approach: we know the structure of the original function.
-        # After it builds to_cat_prompt, each spatial entry corresponds to a
-        # memory frame.  The frame indices follow a known pattern from
-        # selected_cond_outputs + the t_pos loop.
-        #
-        # Let's just record which frames are accessed by wrapping
-        # output_dict access.
-
-        class _OutputDictTracker:
-            """Wraps output_dict to record which frame indices are accessed
-            for spatial memory and obj_ptr."""
-            def __init__(self, real_dict):
-                self._real = real_dict
-                self.spatial_accessed = []  # (frame_idx, is_cond)
-                self.ptr_accessed = []      # (frame_idx,)
-
-            def __getitem__(self, key):
-                return self._real[key]
-
-            def __contains__(self, key):
-                return key in self._real
-
-            def get(self, key, default=None):
-                return self._real.get(key, default)
-
-            def keys(self):
-                return self._real.keys()
-
-            def items(self):
-                return self._real.items()
-
-            def values(self):
-                return self._real.values()
-
-            def __len__(self):
-                return len(self._real)
-
-        # This approach is getting too complex with monkey-patching internals.
-        # Let's use a simpler and more robust approach: wrap the encoder.
-        # Since the original _prepare_memory_conditioned_features already
-        # builds to_cat_prompt with known structure, we can compute the mask
-        # from the output_dict frame indices BEFORE calling the original fn.
-
         # Gather which frames have spatial memory in output_dict
         spatial_frame_indices = []
         H_mem, W_mem = feat_sizes[-1]
@@ -988,22 +881,45 @@ def _install_obj_attention_mask(model):
             if out is not None:
                 ptr_frame_indices.append(t)
 
-        # Stash frame info on the encoder so the wrapper can build the mask
-        real_encoder._spatial_frames_info = [
-            (fidx, seq_len_per_frame) for fidx in spatial_frame_indices
-        ]
-        # Each obj_ptr token has 1 token per frame (or C//mem_dim if split)
+        # Build the mask and stash it on the encoder for injection.
+        # We monkey-patch the encoder's forward to inject the mask, since
+        # we can't replace the encoder module (nn.Module __setattr__ check).
         ptr_tokens_per_frame = 1
         if self.mem_dim < self.hidden_dim:
             ptr_tokens_per_frame = self.hidden_dim // self.mem_dim
-        real_encoder._ptr_frames_info = [
-            (fidx, ptr_tokens_per_frame) for fidx in ptr_frame_indices
-        ]
 
-        # Temporarily swap encoder with mask-aware wrapper
-        self.transformer.encoder = _EncoderWithMask(
-            real_encoder, first_frame_per_batch, B, device
-        )
+        # Pre-compute the full prompt mask
+        total_spatial = sum(seq_len_per_frame for _ in spatial_frame_indices)
+        total_ptr = sum(ptr_tokens_per_frame for _ in ptr_frame_indices)
+        total_prompt_len = total_spatial + total_ptr
+
+        if total_prompt_len > 0:
+            obj_mask = torch.zeros(B, total_prompt_len, device=device, dtype=torch.bool)
+            offset = 0
+            for fidx in spatial_frame_indices:
+                for obj_batch_idx, first_f in enumerate(first_frame_per_batch):
+                    if fidx < first_f:
+                        obj_mask[obj_batch_idx, offset:offset + seq_len_per_frame] = True
+                offset += seq_len_per_frame
+            for fidx in ptr_frame_indices:
+                for obj_batch_idx, first_f in enumerate(first_frame_per_batch):
+                    if fidx < first_f:
+                        obj_mask[obj_batch_idx, offset:offset + ptr_tokens_per_frame] = True
+                offset += ptr_tokens_per_frame
+            has_mask = obj_mask.any()
+        else:
+            has_mask = False
+
+        # Temporarily wrap the encoder's forward to inject the mask
+        real_encoder = self.transformer.encoder
+        real_forward = real_encoder.forward
+
+        if has_mask:
+            def _masked_forward(*args, **kwargs):
+                kwargs["prompt_key_padding_mask"] = obj_mask
+                return real_forward(*args, **kwargs)
+            real_encoder.forward = _masked_forward
+
         try:
             result = _orig_fn(
                 frame_idx=frame_idx,
@@ -1017,8 +933,8 @@ def _install_obj_attention_mask(model):
                 use_prev_mem_frame=use_prev_mem_frame,
             )
         finally:
-            # Restore the real encoder
-            self.transformer.encoder = real_encoder
+            # Restore the original forward
+            real_encoder.forward = real_forward
         return result
 
     tracker._prepare_memory_conditioned_features = types.MethodType(
