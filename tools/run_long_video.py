@@ -379,12 +379,16 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 # Trim tracker output_dict to keep only maskmem_features + obj_ptr
 # ---------------------------------------------------------------------------
 
-def _trim_tracker_output_dict(tracker_state, current_frame_idx, num_maskmem=7):
+def _trim_tracker_output_dict(tracker_state, current_frame_idx,
+                              num_maskmem=7, max_obj_ptrs=32):
     """Remove heavy tensors from the tracker's output_dict.
 
     Keeps:
-    - ``maskmem_features`` + ``maskmem_pos_enc`` only for the most recent
-      ``num_maskmem`` frames (the tracker's spatial memory window).
+    - ``maskmem_features`` + ``maskmem_pos_enc`` for frames within the
+      spatial memory reach.  With ``use_memory_selection``, frame_filter
+      can pick ANY frame within ``max_obj_ptrs`` distance (not just the
+      most recent ``num_maskmem``).  So we keep spatial memory for
+      ``max(num_maskmem, max_obj_ptrs)`` frames back.
     - ``obj_ptr`` + ``eff_iou_score`` for ALL frames (needed for long-range
       re-id via object pointer cross-attention).
 
@@ -397,7 +401,11 @@ def _trim_tracker_output_dict(tracker_state, current_frame_idx, num_maskmem=7):
     keys_recent_keep = {"maskmem_features", "maskmem_pos_enc"}
     keys_to_keep_recent = keys_always_keep | keys_recent_keep
 
-    spatial_cutoff = current_frame_idx - num_maskmem
+    # frame_filter with use_memory_selection can pick any frame within
+    # max_obj_ptrs distance that has a good eff_iou_score.  Those frames
+    # need maskmem_features for spatial memory attention.
+    spatial_window = max(num_maskmem, max_obj_ptrs)
+    spatial_cutoff = current_frame_idx - spatial_window
 
     def _trim_bucket(bucket):
         for fidx, frame_out in bucket.items():
@@ -1089,9 +1097,12 @@ def run_long_video(
             _consolidate_tracker_states(model, inference_state, frame_idx)
 
         # -- trim tracker memory to keep only spatial + obj_ptr --------------
-        num_maskmem = model.tracker.num_maskmem  # typically 7
         for tracker_state in inference_state["tracker_inference_states"]:
-            _trim_tracker_output_dict(tracker_state, frame_idx, num_maskmem)
+            _trim_tracker_output_dict(
+                tracker_state, frame_idx,
+                num_maskmem=model.tracker.num_maskmem,
+                max_obj_ptrs=max_obj_ptrs,
+            )
 
         # -- clear cached frame outputs (full-res masks we no longer need) ---
         inference_state["cached_frame_outputs"].pop(frame_idx, None)
