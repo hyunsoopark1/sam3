@@ -727,20 +727,28 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
 # ---------------------------------------------------------------------------
 
 def _install_memory_guard(model):
-    """Patch the tracker to skip frames with maskmem_features=None."""
+    """Patch the tracker to handle frames where heavy tensors have been
+    trimmed (set to None or deleted).
+
+    Two patches:
+    1. _prepare_memory_conditioned_features: hide frames with
+       maskmem_features=None so the tracker skips them in spatial attention.
+    2. remove_object's _slice_state: guard against missing keys when
+       re-slicing output_dict after object removal.
+    """
     import types
 
     tracker = model.tracker
-    _orig_fn = tracker._prepare_memory_conditioned_features
+
+    # --- Patch 1: guard spatial memory access ---
+    _orig_prepare = tracker._prepare_memory_conditioned_features
 
     @torch.inference_mode()
     def _guarded_prepare_memory(self, frame_idx, is_init_cond_frame,
                                 current_vision_feats, current_vision_pos_embeds,
                                 feat_sizes, output_dict, num_frames,
                                 track_in_reverse=False, use_prev_mem_frame=True):
-        # Temporarily remove frames with maskmem_features=None from
-        # output_dict so the original function's `dict.get()` returns None
-        # for them (causing them to be skipped at line 652).
+        # Temporarily remove frames with maskmem_features=None
         removed = {}
         for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
             bucket = output_dict.get(bucket_name, {})
@@ -748,9 +756,8 @@ def _install_memory_guard(model):
                 out = bucket[fidx]
                 if out is not None and out.get("maskmem_features") is None:
                     removed[(bucket_name, fidx)] = bucket.pop(fidx)
-
         try:
-            result = _orig_fn(
+            result = _orig_prepare(
                 frame_idx=frame_idx,
                 is_init_cond_frame=is_init_cond_frame,
                 current_vision_feats=current_vision_feats,
@@ -762,14 +769,69 @@ def _install_memory_guard(model):
                 use_prev_mem_frame=use_prev_mem_frame,
             )
         finally:
-            # Restore removed frames (they still have obj_ptr etc.)
             for (bucket_name, fidx), out in removed.items():
                 output_dict[bucket_name][fidx] = out
-
         return result
 
     tracker._prepare_memory_conditioned_features = types.MethodType(
         _guarded_prepare_memory, tracker
+    )
+
+    # --- Patch 2: guard remove_object's _slice_state ---
+    _orig_remove = tracker.remove_object
+
+    @torch.inference_mode()
+    def _guarded_remove_object(self, inference_state, obj_id, **kwargs):
+        # Before remove_object runs _slice_state on all frames, ensure
+        # every frame in output_dict has the required keys (even if None).
+        required_keys = [
+            "maskmem_features", "maskmem_pos_enc", "pred_masks",
+            "obj_ptr", "object_score_logits",
+        ]
+        if self.use_memory_selection:
+            required_keys.extend(["iou_score", "eff_iou_score"])
+
+        output_dict = inference_state["output_dict"]
+        batch_size = len(inference_state["obj_ids"])
+
+        for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            bucket = output_dict.get(bucket_name, {})
+            for fidx, out in bucket.items():
+                if out is None:
+                    continue
+                for k in required_keys:
+                    if k not in out or out[k] is None:
+                        # Create a zero placeholder with the right shape
+                        # so _slice_state can index it without crashing
+                        if k == "maskmem_features":
+                            out[k] = torch.zeros(
+                                batch_size, self.mem_dim,
+                                self.sam_image_embedding_size,
+                                self.sam_image_embedding_size,
+                                device="cpu",
+                            )
+                        elif k == "maskmem_pos_enc":
+                            const = inference_state["constants"].get("maskmem_pos_enc")
+                            if const is not None:
+                                out[k] = [x.expand(batch_size, -1, -1, -1) for x in const]
+                            else:
+                                out[k] = None
+                        elif k == "pred_masks":
+                            out[k] = torch.zeros(
+                                batch_size, 1,
+                                self.sam_image_embedding_size * 4,
+                                self.sam_image_embedding_size * 4,
+                                device="cpu",
+                            )
+                        elif k == "obj_ptr":
+                            out[k] = self.no_obj_ptr.expand(batch_size, -1).cpu()
+                        elif k in ("object_score_logits", "iou_score", "eff_iou_score"):
+                            out[k] = torch.zeros(batch_size, 1, device="cpu")
+
+        return _orig_remove(inference_state, obj_id, **kwargs)
+
+    tracker.remove_object = types.MethodType(
+        _guarded_remove_object, tracker
     )
 
 def _install_obj_attention_mask(model):  # pragma: no cover -- not usable
