@@ -379,45 +379,50 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 # Trim tracker output_dict to keep only maskmem_features + obj_ptr
 # ---------------------------------------------------------------------------
 
-def _trim_tracker_output_dict(tracker_state):
-    """Remove all heavy tensors from the tracker's output_dict except the
-    keys the tracker reads from past frames during propagation:
+def _trim_tracker_output_dict(tracker_state, current_frame_idx, num_maskmem=7):
+    """Remove heavy tensors from the tracker's output_dict.
 
-    - ``maskmem_features``  -- spatial memory fed into memory attention
-    - ``maskmem_pos_enc``   -- positional encoding for the spatial memory
-    - ``obj_ptr``           -- object pointer token for cross-attention
-    - ``eff_iou_score``     -- memory-selection score (used by frame_filter
-                               when use_memory_selection=True to pick the
-                               most informative pointers from a large window)
+    Keeps:
+    - ``maskmem_features`` + ``maskmem_pos_enc`` only for the most recent
+      ``num_maskmem`` frames (the tracker's spatial memory window).
+    - ``obj_ptr`` + ``eff_iou_score`` for ALL frames (needed for long-range
+      re-id via object pointer cross-attention).
 
-    Also trims ``output_dict_per_obj`` which stores per-object slices of
-    the same data -- without trimming it accumulates unboundedly.
+    Drops everything else (pred_masks, object_score_logits, etc.) from all
+    frames.  Also trims ``output_dict_per_obj``.
     """
-    keys_to_keep = {"maskmem_features", "maskmem_pos_enc", "obj_ptr", "eff_iou_score"}
+    # Keys to keep on ALL frames (small per frame)
+    keys_always_keep = {"obj_ptr", "eff_iou_score"}
+    # Keys to keep only on recent frames (large per frame)
+    keys_recent_keep = {"maskmem_features", "maskmem_pos_enc"}
+    keys_to_keep_recent = keys_always_keep | keys_recent_keep
+
+    spatial_cutoff = current_frame_idx - num_maskmem
+
+    def _trim_bucket(bucket):
+        for fidx, frame_out in bucket.items():
+            if frame_out is None:
+                continue
+            if fidx >= spatial_cutoff:
+                # Recent frame: keep spatial memory + pointers
+                keep = keys_to_keep_recent
+            else:
+                # Old frame: drop spatial memory, keep only pointers
+                keep = keys_always_keep
+            for k in [k for k in frame_out if k not in keep]:
+                del frame_out[k]
 
     # --- main output_dict ---
     output_dict = tracker_state.get("output_dict")
     if output_dict is not None:
         for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
-            bucket = output_dict.get(bucket_name, {})
-            for frame_out in bucket.values():
-                if frame_out is None:
-                    continue
-                for k in [k for k in frame_out if k not in keys_to_keep]:
-                    del frame_out[k]
+            _trim_bucket(output_dict.get(bucket_name, {}))
 
     # --- per-object sliced output dicts ---
-    # _add_output_per_object stores per-object slices of every frame's output
-    # in output_dict_per_obj.  Without trimming these grow without bound.
     output_dict_per_obj = tracker_state.get("output_dict_per_obj", {})
     for obj_output_dict in output_dict_per_obj.values():
         for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
-            bucket = obj_output_dict.get(bucket_name, {})
-            for frame_out in bucket.values():
-                if frame_out is None:
-                    continue
-                for k in [k for k in frame_out if k not in keys_to_keep]:
-                    del frame_out[k]
+            _trim_bucket(obj_output_dict.get(bucket_name, {}))
 
 
 # ---------------------------------------------------------------------------
@@ -1084,8 +1089,9 @@ def run_long_video(
             _consolidate_tracker_states(model, inference_state, frame_idx)
 
         # -- trim tracker memory to keep only spatial + obj_ptr --------------
+        num_maskmem = model.tracker.num_maskmem  # typically 7
         for tracker_state in inference_state["tracker_inference_states"]:
-            _trim_tracker_output_dict(tracker_state)
+            _trim_tracker_output_dict(tracker_state, frame_idx, num_maskmem)
 
         # -- clear cached frame outputs (full-res masks we no longer need) ---
         inference_state["cached_frame_outputs"].pop(frame_idx, None)
