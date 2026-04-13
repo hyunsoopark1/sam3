@@ -7,10 +7,11 @@ nothing accumulates in memory across frames.
 Key optimizations:
   1. LazyFrameLoader -- loads one frame at a time from disk (image folder or
      video file).  Nothing is kept in CPU or GPU memory after the frame is
-     consumed by the model.
+     consumed by the model.  ``init_state`` is bypassed entirely so that
+     ``load_resource_as_video_frames`` is never called.
   2. After every frame the tracker's per-frame output_dict is trimmed so that
-     only `maskmem_features` (spatial memory) and `obj_ptr` (object pointer)
-     survive.  Everything else -- pred_masks, pred_masks_high_res,
+     only ``maskmem_features`` (spatial memory) and ``obj_ptr`` (object
+     pointer) survive.  Everything else -- pred_masks, pred_masks_high_res,
      maskmem_pos_enc, object_score_logits, etc. -- is deleted immediately.
   3. cached_frame_outputs is cleared after each frame.
 
@@ -88,7 +89,6 @@ class LazyFrameLoader:
             raise RuntimeError(f"No images found in {folder}")
         self._img_paths = [os.path.join(folder, n) for n in frame_names]
         self._num_frames = len(self._img_paths)
-        # Read original dimensions from first frame
         first = Image.open(self._img_paths[0])
         self.orig_width, self.orig_height = first.size
 
@@ -115,13 +115,10 @@ class LazyFrameLoader:
         cap.release()
         if self._num_frames <= 0:
             raise RuntimeError(f"Could not determine frame count for {path}")
-        # We will open a fresh VideoCapture and seek on each access.
-        # For sequential access this is fine (cv2 seeks efficiently forward).
         self._cap = None
         self._cap_pos = -1
 
     def _load_from_video(self, index: int) -> torch.Tensor:
-        # Open / reuse the capture, seeking only when needed.
         if self._cap is None or not self._cap.isOpened():
             self._cap = cv2.VideoCapture(self._video_path)
             self._cap_pos = 0
@@ -160,13 +157,12 @@ class LazyFrameLoader:
     def fps(self):
         if self._backend == "video":
             return self._fps
-        return 30.0  # default for image folders
+        return 30.0
 
 
 # ---------------------------------------------------------------------------
 # Raw frame reader -- reads the original (un-normalised) RGB frame for
-# visualization.  Shares the same sequential-seek cv2.VideoCapture for video
-# files so that sequential reads are efficient.
+# visualization overlay.
 # ---------------------------------------------------------------------------
 
 class RawFrameReader:
@@ -217,10 +213,99 @@ class RawFrameReader:
 
 
 # ---------------------------------------------------------------------------
+# Build inference_state WITHOUT loading all frames into memory.
+#
+# This replicates Sam3VideoInference.init_state() +
+# _construct_initial_input_batch() but passes the LazyFrameLoader directly
+# as img_batch, so load_resource_as_video_frames() is never called.
+# ---------------------------------------------------------------------------
+
+def _build_inference_state(model, lazy_loader: LazyFrameLoader):
+    """Construct the inference_state dict that Sam3VideoInference normally
+    builds inside ``init_state``, but use *lazy_loader* as the image source
+    instead of loading every frame into a tensor.
+    """
+    from sam3.model.data_misc import BatchedDatapoint, FindStage, convert_my_tensors
+    from sam3.model.geometry_encoders import Prompt
+    from sam3.model.utils.misc import copy_data_to_device
+
+    num_frames = len(lazy_loader)
+    device = model.device
+
+    # --- FindStage per frame (tiny tensors, negligible memory) ---------------
+    input_box_embedding_dim = 258
+    input_points_embedding_dim = 257
+    stages = [
+        FindStage(
+            img_ids=[stage_id],
+            text_ids=[0],
+            input_boxes=[torch.zeros(input_box_embedding_dim)],
+            input_boxes_mask=[torch.empty(0, dtype=torch.bool)],
+            input_boxes_label=[torch.empty(0, dtype=torch.long)],
+            input_points=[torch.empty(0, input_points_embedding_dim)],
+            input_points_mask=[torch.empty(0)],
+            object_ids=[],
+        )
+        for stage_id in range(num_frames)
+    ]
+    for i in range(len(stages)):
+        stages[i] = convert_my_tensors(stages[i])
+
+    # --- BatchedDatapoint with lazy_loader as img_batch ----------------------
+    # copy_data_to_device recurses into the dataclass.  For the LazyFrameLoader
+    # it falls through to ``return data`` (not a tensor/list/dict/dataclass),
+    # so it stays on CPU -- exactly what we want.  The backbone will call
+    # ``img_batch[frame_idx]`` and ``.to(device)`` on a per-frame basis.
+    input_batch = BatchedDatapoint(
+        img_batch=lazy_loader,
+        find_text_batch=["<text placeholder>", "visual"],
+        find_inputs=stages,
+        find_targets=[None] * num_frames,
+        find_metadatas=[None] * num_frames,
+    )
+    input_batch = copy_data_to_device(input_batch, device, non_blocking=True)
+
+    # --- Assemble the full inference_state ----------------------------------
+    bs = 1
+    inference_state = {
+        "image_size": model.image_size,
+        "num_frames": num_frames,
+        "orig_height": lazy_loader.orig_height,
+        "orig_width": lazy_loader.orig_width,
+        "constants": {
+            "empty_geometric_prompt": Prompt(
+                box_embeddings=torch.zeros(0, bs, 4, device=device),
+                box_mask=torch.zeros(bs, 0, device=device, dtype=torch.bool),
+                box_labels=torch.zeros(0, bs, device=device, dtype=torch.long),
+                point_embeddings=torch.zeros(0, bs, 2, device=device),
+                point_mask=torch.zeros(bs, 0, device=device, dtype=torch.bool),
+                point_labels=torch.zeros(0, bs, device=device, dtype=torch.long),
+            ),
+        },
+        "input_batch": input_batch,
+        "previous_stages_out": [None] * num_frames,
+        "text_prompt": None,
+        "per_frame_raw_point_input": [None] * num_frames,
+        "per_frame_raw_box_input": [None] * num_frames,
+        "per_frame_visual_prompt": [None] * num_frames,
+        "per_frame_geometric_prompt": [None] * num_frames,
+        "per_frame_cur_step": [0] * num_frames,
+        "visual_prompt_embed": None,
+        "visual_prompt_mask": None,
+        "tracker_inference_states": [],
+        "tracker_metadata": {},
+        "feature_cache": {},
+        "cached_frame_outputs": {},
+        "action_history": [],
+        "is_image_only": False,
+    }
+    return inference_state
+
+
+# ---------------------------------------------------------------------------
 # Render a single overlay frame -- masks + bounding boxes + labels
 # ---------------------------------------------------------------------------
 
-# Deterministic, perceptually-distinct colours (generated once)
 _COLOR_CACHE = None
 
 
@@ -232,7 +317,6 @@ def _get_colors():
         from sam3.visualization_utils import COLORS
         _COLOR_CACHE = COLORS
     except ImportError:
-        # Fallback: simple tab-style palette
         rng = np.random.RandomState(42)
         _COLOR_CACHE = rng.rand(128, 3).astype(np.float64)
     return _COLOR_CACHE
@@ -240,18 +324,7 @@ def _get_colors():
 
 def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
                    alpha: float = 0.45) -> np.ndarray:
-    """Overlay masks, boxes and labels on a raw RGB frame.
-
-    Args:
-        img_rgb:   (H, W, 3) uint8 RGB image.
-        outputs:   Dict from propagate_in_video (keys: out_binary_masks,
-                   out_obj_ids, out_boxes_xywh, out_probs).
-        frame_idx: Frame number (drawn in top-left corner).
-        alpha:     Mask opacity.
-
-    Returns:
-        (H, W, 3) uint8 RGB overlay image.
-    """
+    """Overlay masks, boxes and labels on a raw RGB frame."""
     colors = _get_colors()
     overlay = img_rgb.copy()
     h, w = overlay.shape[:2]
@@ -266,7 +339,6 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
             color = colors[int(oid) % len(colors)]
             c_uint8 = (color * 255).astype(np.uint8)
 
-            # -- mask overlay --
             mask = masks[i]
             if mask.shape != (h, w):
                 mask = cv2.resize(
@@ -279,15 +351,12 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
                     alpha * c_uint8[c] + (1 - alpha) * overlay[..., c][m]
                 ).astype(np.uint8)
 
-            # -- bounding box --
             if boxes is not None:
                 bx, by, bw, bh = boxes[i]
                 x1, y1 = int(bx * w), int(by * h)
                 x2, y2 = int((bx + bw) * w), int((by + bh) * h)
                 c_bgr = tuple(int(x) for x in c_uint8)
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), c_bgr, 2)
-
-                # -- label text --
                 prob = probs[i] if probs is not None else None
                 label = f"id={int(oid)}"
                 if prob is not None:
@@ -297,7 +366,6 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, c_bgr, 2, cv2.LINE_AA,
                 )
 
-    # -- frame counter --
     cv2.putText(
         overlay, f"Frame {frame_idx}", (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA,
@@ -381,13 +449,11 @@ def run_long_video(
     # ---- 3. Raw frame reader for visualization -----------------------------
     raw_reader = RawFrameReader(video_path)
 
-    # ---- 4. Build inference_state with the lazy loader ---------------------
-    inference_state = model.init_state(
-        resource_path=video_path,
-        offload_video_to_cpu=True,
-    )
-    # Replace the pre-loaded image batch with our lazy loader.
-    inference_state["input_batch"].img_batch = loader
+    # ---- 4. Build inference_state directly (NO init_state call) -------------
+    #  This avoids load_resource_as_video_frames which would load every frame
+    #  into a CPU tensor and explode memory.
+    print("Building inference state (lazy -- no frames loaded) ...")
+    inference_state = _build_inference_state(model, loader)
 
     # ---- 5. Add text prompt on frame 0 -------------------------------------
     print(f"Adding text prompt: '{text_prompt}' on frame 0 ...")
@@ -408,7 +474,6 @@ def run_long_video(
     )
 
     # ---- 6. Open video writer -----------------------------------------------
-    # Write to a temp file first, then re-encode with ffmpeg for compatibility.
     tmp_path = output_path + ".tmp.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(tmp_path, fourcc, fps, (orig_w, orig_h))
@@ -439,7 +504,6 @@ def run_long_video(
                 overlay, f"Frame {frame_idx}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA,
             )
-        # cv2.VideoWriter expects BGR
         writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
         # -- trim tracker memory to keep only spatial + obj_ptr --------------
@@ -481,7 +545,6 @@ def run_long_video(
         )
         os.remove(tmp_path)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # ffmpeg not available -- keep the raw mp4v file
         os.rename(tmp_path, output_path)
         print("  (ffmpeg not available, using raw mp4v output)")
 
