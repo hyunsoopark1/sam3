@@ -190,28 +190,38 @@ class PersonDetector:
     physically shared with the tracker — no duplicate weights in memory.
     """
 
-    def __init__(self, processor, prompt: str = "person"):
+    def __init__(self, processor, prompt: str = "person", nms_iou: float = 0.5):
         self.processor = processor
         self.prompt = prompt
+        self.nms_iou = nms_iou
 
     @torch.inference_mode()
     def detect(self, frame_rgb: np.ndarray) -> List[Dict]:
         """Detect persons in an RGB frame.
 
         Returns list of ``{"bbox_xyxy": [...], "mask": np.ndarray, "score": float}``.
+        Applies NMS to remove near-duplicate detections.
         """
+        from torchvision.ops import nms
+
         pil_img = Image.fromarray(frame_rgb)
         state = self.processor.set_image(pil_img)
         state = self.processor.set_text_prompt(self.prompt, state)
 
-        persons = []
         if "boxes" not in state or len(state["boxes"]) == 0:
-            return persons
+            return []
 
-        boxes = state["boxes"].float().cpu().numpy()       # (N, 4) xyxy pixels
-        scores = state["scores"].float().cpu().numpy()     # (N,)
-        masks = state["masks"].squeeze(1).cpu().numpy()    # (N, H, W) bool
+        boxes_t = state["boxes"].float()    # (N, 4) xyxy, on device
+        scores_t = state["scores"].float()  # (N,)
 
+        # NMS to suppress near-duplicate boxes
+        keep = nms(boxes_t, scores_t, self.nms_iou)
+
+        boxes = boxes_t[keep].cpu().numpy()
+        scores = scores_t[keep].cpu().numpy()
+        masks = state["masks"].squeeze(1)[keep].cpu().numpy()  # (K, H, W) bool
+
+        persons = []
         for i in range(len(boxes)):
             persons.append({
                 "bbox_xyxy": boxes[i].tolist(),
