@@ -450,15 +450,26 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
     if len(tracker_states) <= 1:
         return  # nothing to consolidate
 
-    # --- collect all obj_ids and build index mapping ---
+    # --- collect all obj_ids, index mapping, and first-appeared frames ---
     # obj_order[i] = (state_idx, position_within_that_state)
     all_obj_ids = []
     obj_order = []
+    obj_first_appeared = {}  # obj_id -> earliest frame in its state's output_dict
     for state_idx, state in enumerate(tracker_states):
         state_obj_ids = state.get("obj_ids", [])
+        # Find the earliest frame in this state's output_dict
+        od = state.get("output_dict", {})
+        earliest = frame_idx
+        for bucket in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            for fidx in od.get(bucket, {}).keys():
+                earliest = min(earliest, fidx)
+        # Also check if tracker already has _obj_first_appeared_frame from
+        # a prior consolidation
+        prior_first = getattr(model.tracker, "_obj_first_appeared_frame", {})
         for pos, oid in enumerate(state_obj_ids):
             all_obj_ids.append(oid)
             obj_order.append((state_idx, pos))
+            obj_first_appeared[oid] = prior_first.get(oid, earliest)
     total_objs = len(all_obj_ids)
     if total_objs == 0:
         return
@@ -631,6 +642,10 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
                         obj_out[k] = v
                 obj_bucket[fidx] = obj_out
 
+    # --- store first-appeared info on the tracker for attention masking ---
+    model.tracker._obj_first_appeared_frame = obj_first_appeared
+    model.tracker._current_inference_state = new_state
+
     # --- replace old states ---
     n_old = len(tracker_states)
     n_objs = len(new_state.get("obj_ids", []))
@@ -640,6 +655,320 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
         f"    [consolidate] frame {frame_idx}: "
         f"merged {n_old} states -> 1 ({n_objs} objs, {n_merged} memory frames transferred)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Option B: per-object attention masking for non-existent frames.
+#
+# Instead of filling no_obj_embed_spatial for objects that didn't exist at a
+# past frame, set the attention mask to True (= exclude) for those objects on
+# that frame's spatial tokens.  This way the cross-attention never sees dummy
+# data -- it just skips those tokens entirely for that object.
+#
+# Enabled with --use_obj_mask.  When disabled, the original no_obj_embed_spatial
+# approach is used (Option A).
+# ---------------------------------------------------------------------------
+
+def _install_obj_attention_mask(model):
+    """Monkey-patch the tracker's _prepare_memory_conditioned_features to build
+    a per-object attention mask based on ``_obj_first_appeared_frame``.
+
+    After patching, the tracker will:
+    1. Check each object's first-appeared frame from the consolidated state
+    2. For spatial memory frames before an object appeared, set that object's
+       mask to True (excluded from attention)
+    3. Same for obj_ptr tokens from frames before the object appeared
+    4. Pass the real mask to the encoder instead of None
+    """
+    import types
+
+    tracker = model.tracker
+    _orig_fn = tracker._prepare_memory_conditioned_features
+
+    @torch.inference_mode()
+    def _patched_prepare_memory_conditioned_features(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        output_dict,
+        num_frames,
+        track_in_reverse=False,
+        use_prev_mem_frame=True,
+    ):
+        # Get the inference state that holds _obj_first_appeared_frame.
+        # We stash it on self during consolidation.
+        first_appeared = getattr(self, "_obj_first_appeared_frame", None)
+        if first_appeared is None:
+            # No consolidation happened yet -- use original path
+            return _orig_fn(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                output_dict=output_dict,
+                num_frames=num_frames,
+                track_in_reverse=track_in_reverse,
+                use_prev_mem_frame=use_prev_mem_frame,
+            )
+
+        # --- Run the original function up to the point where it builds
+        #     to_cat_prompt / to_cat_prompt_mask, then fix the mask. ---
+        # We call the original which sets prompt_mask=None, then re-run
+        # just the mask construction.  Actually, the cleanest approach is
+        # to let the original build everything, then patch the mask before
+        # it's passed to the encoder.  But since the original has the
+        # encoder call inside it, we need to intercept at the right spot.
+        #
+        # The simplest reliable approach: temporarily replace
+        # self.transformer.encoder with a wrapper that intercepts the mask.
+
+        B = current_vision_feats[-1].size(1)  # batch size = num objects
+        device = current_vision_feats[-1].device
+
+        # Build the first_appeared lookup for batch indices
+        # obj_ids in the current state tell us the order
+        _current_state = getattr(self, "_current_inference_state", None)
+        if _current_state is None:
+            return _orig_fn(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                output_dict=output_dict,
+                num_frames=num_frames,
+                track_in_reverse=track_in_reverse,
+                use_prev_mem_frame=use_prev_mem_frame,
+            )
+
+        obj_ids = _current_state.get("obj_ids", [])
+        # first_frame_per_batch[i] = first appeared frame for batch index i
+        first_frame_per_batch = []
+        for oid in obj_ids:
+            first_frame_per_batch.append(first_appeared.get(oid, 0))
+
+        # Intercept the encoder call to inject the mask
+        real_encoder = self.transformer.encoder
+        spatial_frames_info = []  # will be filled by the interceptor
+
+        class _EncoderWithMask:
+            """Wrapper that intercepts the encoder call to inject a real
+            prompt_key_padding_mask based on per-object first-appeared frame."""
+
+            def __init__(self, real_enc, first_frames, batch_size, device):
+                self.real_enc = real_enc
+                self.first_frames = first_frames  # list[int], len=B
+                self.B = batch_size
+                self.device = device
+                # Forward any attribute access to the real encoder
+                for attr in dir(real_enc):
+                    if not attr.startswith("_") and not hasattr(self, attr):
+                        try:
+                            setattr(self, attr, getattr(real_enc, attr))
+                        except Exception:
+                            pass
+
+            def __call__(self, *args, **kwargs):
+                # Build the per-object mask from spatial_frames_info
+                # spatial_frames_info is populated by the patched
+                # _prepare_memory_conditioned_features above via the
+                # to_cat_prompt_mask list.  But we actually need the frame
+                # indices for each spatial chunk.
+                #
+                # The prompt has structure:
+                #   [spatial_chunk_0, spatial_chunk_1, ..., obj_ptr_chunk]
+                # We need to know which frame each spatial chunk came from.
+                #
+                # Since we can't easily extract this from the original fn,
+                # we take a different approach: read the frame info that
+                # was stashed on the tracker by the consolidation code.
+                spatial_info = getattr(self.real_enc, "_spatial_frames_info", None)
+                if spatial_info is not None and len(spatial_info) > 0:
+                    prompt = kwargs.get("prompt", args[5] if len(args) > 5 else None)
+                    if prompt is not None:
+                        total_len = prompt.shape[0]
+                        # Build mask: (B, total_len), True = exclude
+                        mask = torch.zeros(self.B, total_len, device=self.device, dtype=torch.bool)
+                        offset = 0
+                        for (mem_frame_idx, seq_len) in spatial_info:
+                            for obj_batch_idx, first_f in enumerate(self.first_frames):
+                                if mem_frame_idx < first_f:
+                                    mask[obj_batch_idx, offset:offset + seq_len] = True
+                            offset += seq_len
+                        # Also mask obj_ptr tokens (they come after spatial tokens)
+                        ptr_info = getattr(self.real_enc, "_ptr_frames_info", None)
+                        if ptr_info is not None:
+                            for (ptr_frame_idx, ptr_len) in ptr_info:
+                                for obj_batch_idx, first_f in enumerate(self.first_frames):
+                                    if ptr_frame_idx < first_f:
+                                        mask[obj_batch_idx, offset:offset + ptr_len] = True
+                                offset += ptr_len
+                        # Only use mask if any entries are True
+                        if mask.any():
+                            kwargs["prompt_key_padding_mask"] = mask
+                # Clean up
+                self.real_enc._spatial_frames_info = None
+                self.real_enc._ptr_frames_info = None
+                return self.real_enc(*args, **kwargs)
+
+        # Now we need to stash frame info during the original fn's execution.
+        # We do this by patching to_cat_prompt_mask collection.
+        # But that's deep inside _prepare_memory_conditioned_features...
+        #
+        # Cleaner approach: we know the structure of the original function.
+        # After it builds to_cat_prompt, each spatial entry corresponds to a
+        # memory frame.  The frame indices follow a known pattern from
+        # selected_cond_outputs + the t_pos loop.
+        #
+        # Let's just record which frames are accessed by wrapping
+        # output_dict access.
+
+        class _OutputDictTracker:
+            """Wraps output_dict to record which frame indices are accessed
+            for spatial memory and obj_ptr."""
+            def __init__(self, real_dict):
+                self._real = real_dict
+                self.spatial_accessed = []  # (frame_idx, is_cond)
+                self.ptr_accessed = []      # (frame_idx,)
+
+            def __getitem__(self, key):
+                return self._real[key]
+
+            def __contains__(self, key):
+                return key in self._real
+
+            def get(self, key, default=None):
+                return self._real.get(key, default)
+
+            def keys(self):
+                return self._real.keys()
+
+            def items(self):
+                return self._real.items()
+
+            def values(self):
+                return self._real.values()
+
+            def __len__(self):
+                return len(self._real)
+
+        # This approach is getting too complex with monkey-patching internals.
+        # Let's use a simpler and more robust approach: wrap the encoder.
+        # Since the original _prepare_memory_conditioned_features already
+        # builds to_cat_prompt with known structure, we can compute the mask
+        # from the output_dict frame indices BEFORE calling the original fn.
+
+        # Gather which frames have spatial memory in output_dict
+        spatial_frame_indices = []
+        H_mem, W_mem = feat_sizes[-1]
+        seq_len_per_frame = H_mem * W_mem
+
+        # Replicate the frame selection logic from the original function
+        from sam3.model.sam3_tracker_utils import select_closest_cond_frames
+        cond_outputs = output_dict["cond_frame_outputs"]
+        selected_cond, unselected_cond = select_closest_cond_frames(
+            frame_idx, cond_outputs,
+            self.max_cond_frames_in_attn,
+            keep_first_cond_frame=self.keep_first_cond_frame,
+        )
+        # Conditioning frames (spatial memory)
+        for t, out in selected_cond.items():
+            if out is not None and out.get("maskmem_features") is not None:
+                spatial_frame_indices.append(t)
+
+        # Non-conditioning spatial frames
+        r = self.memory_temporal_stride_for_eval
+        if self.use_memory_selection:
+            valid_indices = self.frame_filter(
+                output_dict, track_in_reverse, frame_idx, num_frames, r
+            )
+        for t_pos in range(1, self.num_maskmem):
+            t_rel = self.num_maskmem - t_pos
+            if self.use_memory_selection:
+                if t_rel > len(valid_indices):
+                    continue
+                prev_fidx = valid_indices[-t_rel]
+            else:
+                if t_rel == 1:
+                    prev_fidx = frame_idx - t_rel if not track_in_reverse else frame_idx + t_rel
+                else:
+                    if not track_in_reverse:
+                        prev_fidx = ((frame_idx - 2) // r) * r - (t_rel - 2) * r
+                    else:
+                        prev_fidx = -(-(frame_idx + 2) // r) * r + (t_rel - 2) * r
+            out = output_dict["non_cond_frame_outputs"].get(prev_fidx)
+            if out is None:
+                out = unselected_cond.get(prev_fidx)
+            if out is not None and out.get("maskmem_features") is not None:
+                spatial_frame_indices.append(prev_fidx)
+
+        # Obj_ptr frame indices
+        ptr_frame_indices = []
+        tpos_sign_mul = -1 if track_in_reverse else 1
+        max_obj_ptrs = min(num_frames, self.max_obj_ptrs_in_encoder)
+        # conditioning frame pointers
+        if not self.training:
+            ptr_cond = {t: out for t, out in selected_cond.items()
+                        if (t >= frame_idx if track_in_reverse else t <= frame_idx)}
+        else:
+            ptr_cond = selected_cond
+        for t in ptr_cond:
+            ptr_frame_indices.append(t)
+        # non-conditioning pointers
+        for t_diff in range(1, max_obj_ptrs):
+            if not self.use_memory_selection:
+                t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+                if t < 0 or (num_frames is not None and t >= num_frames):
+                    break
+            else:
+                if -t_diff <= -len(valid_indices):
+                    break
+                t = valid_indices[-t_diff]
+            out = output_dict["non_cond_frame_outputs"].get(t, unselected_cond.get(t))
+            if out is not None:
+                ptr_frame_indices.append(t)
+
+        # Stash frame info on the encoder so the wrapper can build the mask
+        real_encoder._spatial_frames_info = [
+            (fidx, seq_len_per_frame) for fidx in spatial_frame_indices
+        ]
+        # Each obj_ptr token has 1 token per frame (or C//mem_dim if split)
+        ptr_tokens_per_frame = 1
+        if self.mem_dim < self.hidden_dim:
+            ptr_tokens_per_frame = self.hidden_dim // self.mem_dim
+        real_encoder._ptr_frames_info = [
+            (fidx, ptr_tokens_per_frame) for fidx in ptr_frame_indices
+        ]
+
+        # Temporarily swap encoder with mask-aware wrapper
+        self.transformer.encoder = _EncoderWithMask(
+            real_encoder, first_frame_per_batch, B, device
+        )
+        try:
+            result = _orig_fn(
+                frame_idx=frame_idx,
+                is_init_cond_frame=is_init_cond_frame,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                output_dict=output_dict,
+                num_frames=num_frames,
+                track_in_reverse=track_in_reverse,
+                use_prev_mem_frame=use_prev_mem_frame,
+            )
+        finally:
+            # Restore the real encoder
+            self.transformer.encoder = real_encoder
+        return result
+
+    tracker._prepare_memory_conditioned_features = types.MethodType(
+        _patched_prepare_memory_conditioned_features, tracker
+    )
+    print("  [obj_mask] Installed per-object attention masking on tracker")
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +983,7 @@ def run_long_video(
     fps: float | None = None,
     gc_every: int = 50,
     max_obj_ptrs: int = 32,
+    use_obj_mask: bool = False,
 ):
     """Run SAM3 on a long video with constant memory, write a visualization MP4.
 
@@ -671,6 +1001,11 @@ def run_long_video(
                       small vector (~2 KB) so the memory cost is negligible,
                       but higher values make the Python-level frame_filter
                       loop iterate over more frames.
+        use_obj_mask: If True, use per-object attention masking (Option B):
+                      exclude spatial memory tokens for frames where an object
+                      didn't exist yet, instead of feeding no_obj_embed_spatial.
+                      If False (default), use the original no_obj_embed_spatial
+                      placeholder approach (Option A).
     """
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -695,6 +1030,10 @@ def run_long_video(
         f"obj_ptr window: {prev_ptrs} -> {max_obj_ptrs} frames "
         f"(~{max_obj_ptrs / 30:.1f}s at 30 fps)"
     )
+
+    # ---- 1c. Optionally install per-object attention masking ---------------
+    if use_obj_mask:
+        _install_obj_attention_mask(model)
 
     # ---- 2. Build lazy frame loader ----------------------------------------
     image_size = model.image_size
@@ -889,6 +1228,13 @@ def main():
              "SAM3 default is 16. Higher = better re-id but slightly more "
              "Python overhead per frame. 128 ≈ 4s, 900 ≈ 30s.",
     )
+    parser.add_argument(
+        "--use_obj_mask", action="store_true", default=False,
+        help="Use per-object attention masking (Option B). Excludes spatial "
+             "memory tokens from cross-attention for frames where an object "
+             "didn't exist yet, instead of feeding no_obj_embed_spatial "
+             "placeholders. Off by default (Option A).",
+    )
     args = parser.parse_args()
 
     run_long_video(
@@ -899,6 +1245,7 @@ def main():
         fps=args.fps,
         gc_every=args.gc_every,
         max_obj_ptrs=args.max_obj_ptrs,
+        use_obj_mask=args.use_obj_mask,
     )
 
 
