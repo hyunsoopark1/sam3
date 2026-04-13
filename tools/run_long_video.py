@@ -712,18 +712,18 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
 
 
 # ---------------------------------------------------------------------------
-# Option B: per-object attention masking for non-existent frames.
+# NOTE: Option B (per-object attention masking) was investigated but is not
+# feasible -- the tracker's RoPEAttention-based decoder layers assert
+# `memory_key_padding_mask is None` (decoder.py:939).  Supporting it would
+# require modifying SAM3's core model code.
 #
-# Instead of filling no_obj_embed_spatial for objects that didn't exist at a
-# past frame, set the attention mask to True (= exclude) for those objects on
-# that frame's spatial tokens.  This way the cross-attention never sees dummy
-# data -- it just skips those tokens entirely for that object.
-#
-# Enabled with --use_obj_mask.  When disabled, the original no_obj_embed_spatial
-# approach is used (Option A).
+# The current approach (Option A) uses no_obj_embed_spatial as a placeholder
+# for objects that didn't exist at past frames.  This is what SAM3 was
+# trained with and works correctly without any model changes.
 # ---------------------------------------------------------------------------
 
-def _install_obj_attention_mask(model):
+def _install_obj_attention_mask(model):  # pragma: no cover
+    """Not usable -- kept only as documentation of the approach."""
     """Monkey-patch the tracker's _prepare_memory_conditioned_features to build
     a per-object attention mask based on ``_obj_first_appeared_frame``.
 
@@ -953,7 +953,6 @@ def run_long_video(
     fps: float | None = None,
     gc_every: int = 50,
     max_obj_ptrs: int = 32,
-    use_obj_mask: bool = False,
 ):
     """Run SAM3 on a long video with constant memory, write a visualization MP4.
 
@@ -971,11 +970,6 @@ def run_long_video(
                       small vector (~2 KB) so the memory cost is negligible,
                       but higher values make the Python-level frame_filter
                       loop iterate over more frames.
-        use_obj_mask: If True, use per-object attention masking (Option B):
-                      exclude spatial memory tokens for frames where an object
-                      didn't exist yet, instead of feeding no_obj_embed_spatial.
-                      If False (default), use the original no_obj_embed_spatial
-                      placeholder approach (Option A).
     """
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -1000,10 +994,6 @@ def run_long_video(
         f"obj_ptr window: {prev_ptrs} -> {max_obj_ptrs} frames "
         f"(~{max_obj_ptrs / 30:.1f}s at 30 fps)"
     )
-
-    # ---- 1c. Optionally install per-object attention masking ---------------
-    if use_obj_mask:
-        _install_obj_attention_mask(model)
 
     # ---- 2. Build lazy frame loader ----------------------------------------
     image_size = model.image_size
@@ -1198,13 +1188,6 @@ def main():
              "SAM3 default is 16. Higher = better re-id but slightly more "
              "Python overhead per frame. 128 ≈ 4s, 900 ≈ 30s.",
     )
-    parser.add_argument(
-        "--use_obj_mask", action="store_true", default=False,
-        help="Use per-object attention masking (Option B). Excludes spatial "
-             "memory tokens from cross-attention for frames where an object "
-             "didn't exist yet, instead of feeding no_obj_embed_spatial "
-             "placeholders. Off by default (Option A).",
-    )
     args = parser.parse_args()
 
     run_long_video(
@@ -1215,7 +1198,6 @@ def main():
         fps=args.fps,
         gc_every=args.gc_every,
         max_obj_ptrs=args.max_obj_ptrs,
-        use_obj_mask=args.use_obj_mask,
     )
 
 
