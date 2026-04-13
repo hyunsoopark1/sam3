@@ -666,8 +666,6 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
             )
 
         new_output_dict[bucket_key][past_fidx] = merged_out
-        if is_cond:
-            new_state["consolidated_frame_inds"]["cond_frame_outputs"].add(past_fidx)
         n_merged += 1
 
     # --- also build merged output_dict_per_obj for the new state ---
