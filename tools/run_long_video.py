@@ -380,45 +380,47 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 # ---------------------------------------------------------------------------
 
 def _trim_tracker_output_dict(tracker_state, current_frame_idx,
-                              num_maskmem=7, max_obj_ptrs=32):
-    """Remove heavy tensors from the tracker's output_dict.
+                              num_maskmem=7):
+    """Remove heavy tensors from the tracker's output_dict, and offload
+    old spatial memory to CPU.
 
-    Keeps:
-    - ``maskmem_features`` + ``maskmem_pos_enc`` for frames within the
-      spatial memory reach.  With ``use_memory_selection``, frame_filter
-      can pick ANY frame within ``max_obj_ptrs`` distance (not just the
-      most recent ``num_maskmem``).  So we keep spatial memory for
-      ``max(num_maskmem, max_obj_ptrs)`` frames back.
-    - ``obj_ptr`` + ``eff_iou_score`` for ALL frames (needed for long-range
-      re-id via object pointer cross-attention).
+    - ``maskmem_features`` is NEVER deleted (the tracker's frame_filter with
+      use_memory_selection can pick any past frame for spatial attention).
+      Instead, old frames' maskmem_features are moved to CPU to save GPU
+      memory.  The tracker loads them back with ``.cuda(non_blocking=True)``.
+    - ``maskmem_pos_enc`` is the same constant across frames, so kept.
+    - ``obj_ptr`` + ``eff_iou_score`` are kept on GPU (small, needed for
+      pointer cross-attention and memory selection).
+    - Everything else (pred_masks, pred_masks_high_res, object_score_logits,
+      iou_score, etc.) is deleted from all frames.
 
-    Drops everything else (pred_masks, object_score_logits, etc.) from all
-    frames.  Also trims ``output_dict_per_obj``.
+    Also trims ``output_dict_per_obj``.
     """
-    # Keys to keep on ALL frames (small per frame)
-    keys_always_keep = {"obj_ptr", "eff_iou_score"}
-    # Keys to keep only on recent frames (large per frame)
-    keys_recent_keep = {"maskmem_features", "maskmem_pos_enc"}
-    keys_to_keep_recent = keys_always_keep | keys_recent_keep
-
-    # frame_filter with use_memory_selection can pick any frame within
-    # max_obj_ptrs distance that has a good eff_iou_score.  Those frames
-    # need maskmem_features for spatial memory attention.
-    spatial_window = max(num_maskmem, max_obj_ptrs)
-    spatial_cutoff = current_frame_idx - spatial_window
+    keys_to_keep = {
+        "maskmem_features", "maskmem_pos_enc", "obj_ptr", "eff_iou_score",
+    }
+    # Frames older than this get maskmem_features offloaded to CPU
+    offload_cutoff = current_frame_idx - num_maskmem
 
     def _trim_bucket(bucket):
         for fidx, frame_out in bucket.items():
             if frame_out is None:
                 continue
-            if fidx >= spatial_cutoff:
-                # Recent frame: keep spatial memory + pointers
-                keep = keys_to_keep_recent
-            else:
-                # Old frame: drop spatial memory, keep only pointers
-                keep = keys_always_keep
-            for k in [k for k in frame_out if k not in keep]:
+            # Delete unwanted keys
+            for k in [k for k in frame_out if k not in keys_to_keep]:
                 del frame_out[k]
+            # Offload old spatial memory to CPU (saves GPU, tracker will
+            # .cuda() it back when needed)
+            if fidx < offload_cutoff:
+                feats = frame_out.get("maskmem_features")
+                if feats is not None and feats.is_cuda:
+                    frame_out["maskmem_features"] = feats.cpu()
+                pos_enc = frame_out.get("maskmem_pos_enc")
+                if pos_enc is not None and isinstance(pos_enc, list):
+                    frame_out["maskmem_pos_enc"] = [
+                        x.cpu() if isinstance(x, torch.Tensor) and x.is_cuda else x
+                        for x in pos_enc
+                    ]
 
     # --- main output_dict ---
     output_dict = tracker_state.get("output_dict")
@@ -1096,12 +1098,11 @@ def run_long_video(
         if len(inference_state["tracker_inference_states"]) > 1:
             _consolidate_tracker_states(model, inference_state, frame_idx)
 
-        # -- trim tracker memory to keep only spatial + obj_ptr --------------
+        # -- trim tracker memory; offload old spatial memory to CPU -------------
         for tracker_state in inference_state["tracker_inference_states"]:
             _trim_tracker_output_dict(
                 tracker_state, frame_idx,
                 num_maskmem=model.tracker.num_maskmem,
-                max_obj_ptrs=max_obj_ptrs,
             )
 
         # -- clear cached frame outputs (full-res masks we no longer need) ---
