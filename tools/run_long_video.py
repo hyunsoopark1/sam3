@@ -389,21 +389,35 @@ def _trim_tracker_output_dict(tracker_state):
     - ``eff_iou_score``     -- memory-selection score (used by frame_filter
                                when use_memory_selection=True to pick the
                                most informative pointers from a large window)
-    """
-    output_dict = tracker_state.get("output_dict")
-    if output_dict is None:
-        return
 
+    Also trims ``output_dict_per_obj`` which stores per-object slices of
+    the same data -- without trimming it accumulates unboundedly.
+    """
     keys_to_keep = {"maskmem_features", "maskmem_pos_enc", "obj_ptr", "eff_iou_score"}
 
-    for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
-        bucket = output_dict.get(bucket_name, {})
-        for frame_out in bucket.values():
-            if frame_out is None:
-                continue
-            keys_to_delete = [k for k in frame_out if k not in keys_to_keep]
-            for k in keys_to_delete:
-                del frame_out[k]
+    # --- main output_dict ---
+    output_dict = tracker_state.get("output_dict")
+    if output_dict is not None:
+        for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            bucket = output_dict.get(bucket_name, {})
+            for frame_out in bucket.values():
+                if frame_out is None:
+                    continue
+                for k in [k for k in frame_out if k not in keys_to_keep]:
+                    del frame_out[k]
+
+    # --- per-object sliced output dicts ---
+    # _add_output_per_object stores per-object slices of every frame's output
+    # in output_dict_per_obj.  Without trimming these grow without bound.
+    output_dict_per_obj = tracker_state.get("output_dict_per_obj", {})
+    for obj_output_dict in output_dict_per_obj.values():
+        for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            bucket = obj_output_dict.get(bucket_name, {})
+            for frame_out in bucket.values():
+                if frame_out is None:
+                    continue
+                for k in [k for k in frame_out if k not in keys_to_keep]:
+                    del frame_out[k]
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +431,7 @@ def run_long_video(
     gpus_to_use=None,
     fps: float | None = None,
     gc_every: int = 50,
-    max_obj_ptrs: int = 128,
+    max_obj_ptrs: int = 32,
 ):
     """Run SAM3 on a long video with constant memory, write a visualization MP4.
 
@@ -430,10 +444,11 @@ def run_long_video(
                       (or 30 for image folders).
         gc_every:     Run gc.collect + cuda.empty_cache every N frames.
         max_obj_ptrs: Maximum number of past-frame object pointers the tracker
-                      attends to.  Default 16 only looks ~0.5 s back.  Set to
-                      128+ so the model can re-identify objects that disappeared
-                      for a long time.  The obj_ptr per frame is a single small
-                      vector (~2 KB), so even thousands of pointers are cheap.
+                      attends to.  SAM3 default is 16 (~0.5 s at 30 fps).
+                      32 ≈ 1 s, 128 ≈ 4 s, 900 ≈ 30 s.  Each pointer is a
+                      small vector (~2 KB) so the memory cost is negligible,
+                      but higher values make the Python-level frame_filter
+                      loop iterate over more frames.
     """
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -510,6 +525,10 @@ def run_long_video(
     # ---- 7. Propagate, render each frame, write to video -------------------
     print("Propagating and rendering ...")
     t0 = time.time()
+    t_model_total = 0.0  # time inside model (between yields)
+    t_vis_total = 0.0    # time for reading raw frame + rendering overlay
+    t_trim_total = 0.0   # time for output trimming + GC
+    t_yield_start = time.time()
 
     for response in predictor.handle_stream_request(
         dict(
@@ -518,10 +537,14 @@ def run_long_video(
             propagation_direction="forward",
         )
     ):
+        t_model_end = time.time()
+        t_model_total += t_model_end - t_yield_start
+
         frame_idx = response["frame_index"]
         outputs = response["outputs"]
 
         # -- read raw frame & render overlay ---------------------------------
+        t_vis_start = time.time()
         raw_frame = raw_reader.read(frame_idx)  # (H, W, 3) uint8 RGB
         if outputs is not None:
             overlay = render_overlay(raw_frame, outputs, frame_idx)
@@ -532,8 +555,10 @@ def run_long_video(
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA,
             )
         writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        t_vis_total += time.time() - t_vis_start
 
         # -- trim tracker memory to keep only spatial + obj_ptr --------------
+        t_trim_start = time.time()
         for tracker_state in inference_state["tracker_inference_states"]:
             _trim_tracker_output_dict(tracker_state)
 
@@ -544,15 +569,29 @@ def run_long_video(
         if frame_idx % gc_every == 0 and frame_idx > 0:
             gc.collect()
             torch.cuda.empty_cache()
+        t_trim_total += time.time() - t_trim_start
 
-        if frame_idx % 100 == 0:
+        # -- per-frame timing report -----------------------------------------
+        if frame_idx > 0 and frame_idx % 50 == 0:
+            n = frame_idx + 1
             mem_mb = torch.cuda.memory_allocated() // (1024 * 1024)
+            n_states = len(inference_state["tracker_inference_states"])
+            n_objs = sum(
+                len(s.get("obj_ids", []))
+                for s in inference_state["tracker_inference_states"]
+            )
             elapsed = time.time() - t0
-            speed = (frame_idx + 1) / elapsed if elapsed > 0 else 0
             print(
                 f"  frame {frame_idx}/{num_frames}  |  "
-                f"GPU mem {mem_mb} MiB  |  {speed:.1f} fps"
+                f"model {t_model_total/n*1000:.0f}ms  "
+                f"vis {t_vis_total/n*1000:.0f}ms  "
+                f"trim {t_trim_total/n*1000:.0f}ms  |  "
+                f"{n/elapsed:.1f} fps  |  "
+                f"GPU {mem_mb}MiB  "
+                f"states={n_states} objs={n_objs}"
             )
+
+        t_yield_start = time.time()
 
     writer.release()
     raw_reader.close()
@@ -618,10 +657,11 @@ def main():
         help="GPU IDs to use (default: current device only).",
     )
     parser.add_argument(
-        "--max_obj_ptrs", type=int, default=128,
-        help="Max object-pointer memory window (default: 128). "
+        "--max_obj_ptrs", type=int, default=32,
+        help="Max object-pointer memory window (default: 32 ≈ 1s at 30fps). "
              "Controls how far back the tracker looks for re-identification. "
-             "Default SAM3 is 16 (~0.5s at 30fps). 128 ≈ 4s, 900 ≈ 30s.",
+             "SAM3 default is 16. Higher = better re-id but slightly more "
+             "Python overhead per frame. 128 ≈ 4s, 900 ≈ 30s.",
     )
     args = parser.parse_args()
 
