@@ -484,59 +484,57 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
     feature_cache = inference_state["feature_cache"]
     num_frames = inference_state["num_frames"]
 
-    # --- create a fresh tracker state and add all objects ---
-    # Use cached_features from the first old state -- it has the current
-    # frame's backbone features from the most recent propagation step.
-    # The video-level feature_cache may have already evicted this frame.
-    existing_cached_features = tracker_states[0].get("cached_features", feature_cache)
+    # --- create a fresh tracker state ---
+    # We DON'T use add_new_mask (which needs backbone features that may be
+    # evicted).  Instead we manually register objects and directly merge
+    # all old states' output_dicts into the new state.
     new_state = model.tracker.init_state(
-        cached_features=existing_cached_features,
+        cached_features=feature_cache,
         video_height=orig_h,
         video_width=orig_w,
         num_frames=num_frames,
     )
     new_state["backbone_out"] = tracker_states[0].get("backbone_out", None)
-    input_mask_res = model.tracker.input_mask_size
 
-    for obj_id in all_obj_ids:
-        mask_tensor = cached.get(obj_id)
-        if mask_tensor is None:
-            continue
-        mask_float = mask_tensor.float()
-        if mask_float.dim() == 3:
-            mask_float = mask_float.squeeze(0)
-        mask_resized = F.interpolate(
-            mask_float[None, None],
-            size=(input_mask_res, input_mask_res),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).squeeze(0) > 0
-        model.tracker.add_new_mask(
-            inference_state=new_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            mask=mask_resized,
-            add_mask_to_memory=True,
-        )
-    model.tracker.propagate_in_video_preflight(new_state, run_mem_encoder=True)
+    # --- manually register all objects (before tracking_has_started) ---
+    from collections import OrderedDict
+    new_state["obj_id_to_idx"] = OrderedDict()
+    new_state["obj_idx_to_id"] = OrderedDict()
+    new_state["obj_ids"] = []
+    new_state["point_inputs_per_obj"] = {}
+    new_state["mask_inputs_per_obj"] = {}
+    new_state["output_dict_per_obj"] = {}
+    new_state["temp_output_dict_per_obj"] = {}
+    for idx, obj_id in enumerate(all_obj_ids):
+        new_state["obj_id_to_idx"][obj_id] = idx
+        new_state["obj_idx_to_id"][idx] = obj_id
+        new_state["point_inputs_per_obj"][idx] = {}
+        new_state["mask_inputs_per_obj"][idx] = {}
+        new_state["output_dict_per_obj"][idx] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        new_state["temp_output_dict_per_obj"][idx] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+    new_state["obj_ids"] = list(all_obj_ids)
+    new_state["tracking_has_started"] = True
 
-    # --- merge past spatial memories into the new state's output_dict -------
-    # Gather all frame indices that have spatial memories in any old state
+    # --- merge ALL frame outputs from old states into the new state ---------
     device = model.device
     no_obj_spatial = model.tracker.no_obj_embed_spatial  # (1, mem_dim)
     no_obj_ptr = model.tracker.no_obj_ptr                # (1, hidden_dim)
     new_output_dict = new_state["output_dict"]
 
-    past_frame_indices = set()
+    all_frame_indices = set()
     for state in tracker_states:
         od = state.get("output_dict", {})
         for bucket in ("cond_frame_outputs", "non_cond_frame_outputs"):
-            past_frame_indices.update(od.get(bucket, {}).keys())
-    # Don't merge the current frame -- it was already set by add_new_mask above
-    past_frame_indices.discard(frame_idx)
+            all_frame_indices.update(od.get(bucket, {}).keys())
 
     n_merged = 0
-    for past_fidx in sorted(past_frame_indices):
+    for past_fidx in sorted(all_frame_indices):
         # For each past frame, build merged tensors across all old states
         # First, find one state that has maskmem_features to get the shape
         ref_feats = None
@@ -591,19 +589,69 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
             if ptr is not None and pos_in_state < ptr.shape[0]:
                 merged_ptr[merged_idx] = ptr[pos_in_state].to(device=device)
 
-        # Get maskmem_pos_enc from the new state's constants (same for all frames)
+        # Get maskmem_pos_enc -- it's the same across all frames/objects.
+        # Try the new state's constants first, then old states' constants.
         pos_enc = new_state["constants"].get("maskmem_pos_enc")
+        if pos_enc is None:
+            for state in tracker_states:
+                pos_enc = state.get("constants", {}).get("maskmem_pos_enc")
+                if pos_enc is not None:
+                    new_state["constants"]["maskmem_pos_enc"] = pos_enc
+                    break
         if pos_enc is not None:
             merged_pos_enc = [x.expand(total_objs, -1, -1, -1) for x in pos_enc]
         else:
             merged_pos_enc = None
 
-        # Store the merged output in the new state's non_cond_frame_outputs
+        # Determine if this frame was a conditioning frame in any old state
+        is_cond = any(
+            past_fidx in state.get("output_dict", {}).get("cond_frame_outputs", {})
+            for state in tracker_states
+        )
+        bucket_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+
+        # Also merge pred_masks and object_score_logits (needed by tracker
+        # for conditioning frame lookups and _run_single_frame_inference)
+        merged_pred_masks = None
+        merged_obj_score = None
+        for merged_idx2, (state_idx2, pos2) in enumerate(obj_order):
+            state2 = tracker_states[state_idx2]
+            od2 = state2.get("output_dict", {})
+            out2 = None
+            for b2 in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                out2 = od2.get(b2, {}).get(past_fidx)
+                if out2 is not None:
+                    break
+            if out2 is None:
+                continue
+            pm = out2.get("pred_masks")
+            if pm is not None and pos2 < pm.shape[0]:
+                if merged_pred_masks is None:
+                    # Initialize with zeros
+                    merged_pred_masks = torch.zeros(
+                        total_objs, *pm.shape[1:],
+                        device=pm.device, dtype=pm.dtype
+                    )
+                merged_pred_masks[merged_idx2] = pm[pos2]
+            osl = out2.get("object_score_logits")
+            if osl is not None and pos2 < osl.shape[0]:
+                if merged_obj_score is None:
+                    merged_obj_score = torch.zeros(
+                        total_objs, *osl.shape[1:],
+                        device=osl.device, dtype=osl.dtype
+                    )
+                merged_obj_score[merged_idx2] = osl[pos2]
+
+        # Store the merged output
         merged_out = {
             "maskmem_features": merged_feats,
             "maskmem_pos_enc": merged_pos_enc,
             "obj_ptr": merged_ptr,
         }
+        if merged_pred_masks is not None:
+            merged_out["pred_masks"] = merged_pred_masks
+        if merged_obj_score is not None:
+            merged_out["object_score_logits"] = merged_obj_score
         # Collect eff_iou_score if available (take max across states)
         eff_scores = []
         for state in tracker_states:
@@ -617,7 +665,9 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
                 eff_scores, key=lambda x: x.item() if hasattr(x, "item") else x
             )
 
-        new_output_dict["non_cond_frame_outputs"][past_fidx] = merged_out
+        new_output_dict[bucket_key][past_fidx] = merged_out
+        if is_cond:
+            new_state["consolidated_frame_inds"]["cond_frame_outputs"].add(past_fidx)
         n_merged += 1
 
     # --- also build merged output_dict_per_obj for the new state ---
@@ -633,8 +683,6 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
             main_bucket = new_output_dict.get(bucket, {})
             obj_bucket = obj_out_dict.get(bucket, {})
             for fidx, main_out in main_bucket.items():
-                if fidx == frame_idx:
-                    continue  # already set by add_new_mask
                 obj_slice = slice(merged_idx, merged_idx + 1)
                 obj_out = {}
                 for k, v in main_out.items():
@@ -649,6 +697,10 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
     # --- store first-appeared info on the tracker for attention masking ---
     model.tracker._obj_first_appeared_frame = obj_first_appeared
     model.tracker._current_inference_state = new_state
+
+    # --- mark all merged frames as tracked ---
+    for fidx in all_frame_indices:
+        new_state["frames_already_tracked"][fidx] = {"reverse": False}
 
     # --- replace old states ---
     n_old = len(tracker_states)
