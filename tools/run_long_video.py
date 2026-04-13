@@ -381,17 +381,20 @@ def render_overlay(img_rgb: np.ndarray, outputs: dict, frame_idx: int,
 
 def _trim_tracker_output_dict(tracker_state):
     """Remove all heavy tensors from the tracker's output_dict except the
-    three keys the tracker reads from past frames during propagation:
+    keys the tracker reads from past frames during propagation:
 
     - ``maskmem_features``  -- spatial memory fed into memory attention
     - ``maskmem_pos_enc``   -- positional encoding for the spatial memory
     - ``obj_ptr``           -- object pointer token for cross-attention
+    - ``eff_iou_score``     -- memory-selection score (used by frame_filter
+                               when use_memory_selection=True to pick the
+                               most informative pointers from a large window)
     """
     output_dict = tracker_state.get("output_dict")
     if output_dict is None:
         return
 
-    keys_to_keep = {"maskmem_features", "maskmem_pos_enc", "obj_ptr"}
+    keys_to_keep = {"maskmem_features", "maskmem_pos_enc", "obj_ptr", "eff_iou_score"}
 
     for bucket_name in ("cond_frame_outputs", "non_cond_frame_outputs"):
         bucket = output_dict.get(bucket_name, {})
@@ -414,6 +417,7 @@ def run_long_video(
     gpus_to_use=None,
     fps: float | None = None,
     gc_every: int = 50,
+    max_obj_ptrs: int = 128,
 ):
     """Run SAM3 on a long video with constant memory, write a visualization MP4.
 
@@ -425,6 +429,11 @@ def run_long_video(
         fps:          Output video FPS.  Defaults to the source video's FPS
                       (or 30 for image folders).
         gc_every:     Run gc.collect + cuda.empty_cache every N frames.
+        max_obj_ptrs: Maximum number of past-frame object pointers the tracker
+                      attends to.  Default 16 only looks ~0.5 s back.  Set to
+                      128+ so the model can re-identify objects that disappeared
+                      for a long time.  The obj_ptr per frame is a single small
+                      vector (~2 KB), so even thousands of pointers are cheap.
     """
     from sam3.model_builder import build_sam3_video_predictor
 
@@ -437,6 +446,18 @@ def run_long_video(
     print("Loading SAM3 model ...")
     predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use)
     model = predictor.model  # Sam3VideoInference
+
+    # ---- 1b. Increase obj_ptr memory window for long-range re-id -----------
+    #  Default max_obj_ptrs_in_encoder=16 only looks ~0.5 s back at 30 fps.
+    #  Each obj_ptr is a single vector (hidden_dim floats ≈ 2 KB) so even
+    #  hundreds of pointers add negligible memory.  The temporal positional
+    #  encoding is sinusoidal and generalises to any range.
+    prev_ptrs = model.tracker.max_obj_ptrs_in_encoder
+    model.tracker.max_obj_ptrs_in_encoder = max_obj_ptrs
+    print(
+        f"obj_ptr window: {prev_ptrs} -> {max_obj_ptrs} frames "
+        f"(~{max_obj_ptrs / 30:.1f}s at 30 fps)"
+    )
 
     # ---- 2. Build lazy frame loader ----------------------------------------
     image_size = model.image_size
@@ -596,6 +617,12 @@ def main():
         "--gpus", type=int, nargs="*", default=None,
         help="GPU IDs to use (default: current device only).",
     )
+    parser.add_argument(
+        "--max_obj_ptrs", type=int, default=128,
+        help="Max object-pointer memory window (default: 128). "
+             "Controls how far back the tracker looks for re-identification. "
+             "Default SAM3 is 16 (~0.5s at 30fps). 128 ≈ 4s, 900 ≈ 30s.",
+    )
     args = parser.parse_args()
 
     run_long_video(
@@ -605,6 +632,7 @@ def main():
         gpus_to_use=args.gpus,
         fps=args.fps,
         gc_every=args.gc_every,
+        max_obj_ptrs=args.max_obj_ptrs,
     )
 
 
