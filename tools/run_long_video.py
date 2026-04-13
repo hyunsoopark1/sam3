@@ -485,8 +485,12 @@ def _consolidate_tracker_states(model, inference_state, frame_idx):
     num_frames = inference_state["num_frames"]
 
     # --- create a fresh tracker state and add all objects ---
+    # Use cached_features from the first old state -- it has the current
+    # frame's backbone features from the most recent propagation step.
+    # The video-level feature_cache may have already evicted this frame.
+    existing_cached_features = tracker_states[0].get("cached_features", feature_cache)
     new_state = model.tracker.init_state(
-        cached_features=feature_cache,
+        cached_features=existing_cached_features,
         video_height=orig_h,
         video_width=orig_w,
         num_frames=num_frames,
